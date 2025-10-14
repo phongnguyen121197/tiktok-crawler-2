@@ -1,6 +1,7 @@
 import gspread
 from google.oauth2.service_account import Credentials
 import os
+import json
 from datetime import datetime
 import logging
 
@@ -16,17 +17,33 @@ class GoogleSheetsClient:
                 'https://www.googleapis.com/auth/drive'
             ]
             
-            # Load credentials from JSON file
-            creds = Credentials.from_service_account_file(
-                'credentials.json',
-                scopes=scope
-            )
+            # Try to read credentials from environment variable (for Railway)
+            credentials_json = os.getenv('GOOGLE_APPLICATION_CREDENTIALS_JSON')
+            
+            if credentials_json:
+                # On Railway - read from env variable
+                logger.info("📦 Loading credentials from environment variable")
+                creds_dict = json.loads(credentials_json)
+                creds = Credentials.from_service_account_info(
+                    creds_dict,
+                    scopes=scope
+                )
+            else:
+                # Local - read from file
+                logger.info("📁 Loading credentials from file")
+                creds = Credentials.from_service_account_file(
+                    'credentials.json',
+                    scopes=scope
+                )
             
             # Authorize the client
             self.client = gspread.authorize(creds)
             
             # Open the spreadsheet
             self.sheet_id = os.getenv('GOOGLE_SHEET_ID')
+            if not self.sheet_id:
+                raise ValueError("GOOGLE_SHEET_ID environment variable is not set")
+            
             self.spreadsheet = self.client.open_by_key(self.sheet_id)
             self.worksheet = self.spreadsheet.sheet1  # First sheet
             
