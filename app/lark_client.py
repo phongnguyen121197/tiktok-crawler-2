@@ -64,6 +64,10 @@ class LarkClient:
         for attempt in range(max_retries):
             token = self._get_valid_token()
             
+            if not token:
+                logger.error("❌ Failed to get valid token")
+                return None
+            
             headers = kwargs.get('headers', {})
             headers['Authorization'] = f'Bearer {token}'
             kwargs['headers'] = headers
@@ -76,23 +80,31 @@ class LarkClient:
                 if data.get('code') == 99991663:
                     logger.warning(f"⚠️ Token invalid (attempt {attempt + 1}/{max_retries}), refreshing...")
                     self._refresh_token()
-                    continue
+                    if attempt < max_retries - 1:
+                        continue
+                    else:
+                        return response
                 
                 return response
                 
             except Exception as e:
-                logger.error(f"❌ Request error: {e}")
+                logger.error(f"❌ Request error on attempt {attempt + 1}: {e}")
                 if attempt == max_retries - 1:
                     raise
         
         return None
     
     def get_all_active_records(self):
-        """Get all active records from Lark Bitable"""
+        """
+        Get all records with non-empty "Link air bài" field from Lark Bitable
+        Filters out records where link is empty
+        """
         url = f"https://open.larksuite.com/open-apis/bitable/v1/apps/{self.bitable_app_token}/tables/{self.table_id}/records"
         
         all_records = []
         page_token = None
+        total_processed = 0
+        skipped_count = 0
         
         try:
             while True:
@@ -115,14 +127,32 @@ class LarkClient:
                     break
                 
                 items = data.get('data', {}).get('items', [])
-                all_records.extend(items)
+                
+                # Filter: Only keep records with non-empty "Link air bài"
+                for item in items:
+                    total_processed += 1
+                    fields = item.get('fields', {})
+                    
+                    # 🔑 FILTER: Check "Link air bài" field
+                    link_value = fields.get("Link air bài", "").strip()
+                    
+                    if not link_value:
+                        skipped_count += 1
+                        logger.debug(f"⏭️  Skipping record {item.get('id')} - empty 'Link air bài'")
+                        continue
+                    
+                    all_records.append(item)
                 
                 # Check for next page
                 page_token = data.get('data', {}).get('page_token')
                 if not page_token:
                     break
             
-            logger.info(f"✅ Retrieved {len(all_records)} records from Lark")
+            logger.info(f"✅ Lark Bitable Scan Complete:")
+            logger.info(f"   • Total records processed: {total_processed}")
+            logger.info(f"   • Records with link: {len(all_records)}")
+            logger.info(f"   • Skipped (empty link): {skipped_count}")
+            
             return all_records
             
         except Exception as e:
