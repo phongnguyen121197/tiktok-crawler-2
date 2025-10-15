@@ -94,10 +94,42 @@ class LarkClient:
         
         return None
     
+    def _extract_link_value(self, link_field):
+        """
+        Extract link value from Lark field
+        Handles both string and dict formats
+        """
+        if not link_field:
+            return ""
+        
+        # If it's a dictionary (Lark link field format)
+        if isinstance(link_field, dict):
+            # Try 'text' first, then 'href'
+            link_value = link_field.get("text", "") or link_field.get("href", "")
+            return str(link_value).strip()
+        
+        # If it's a list (multiple values)
+        if isinstance(link_field, list):
+            if len(link_field) > 0:
+                first_item = link_field[0]
+                if isinstance(first_item, dict):
+                    link_value = first_item.get("text", "") or first_item.get("href", "")
+                else:
+                    link_value = str(first_item)
+                return link_value.strip()
+            return ""
+        
+        # If it's a string
+        if isinstance(link_field, str):
+            return link_field.strip()
+        
+        # Default
+        return ""
+    
     def get_all_active_records(self):
         """
         Get all records with non-empty "Link air bài" field from Lark Bitable
-        DEBUG MODE: Logs all field names to identify correct field name
+        Filters out records where link is empty
         """
         url = f"https://open.larksuite.com/open-apis/bitable/v1/apps/{self.bitable_app_token}/tables/{self.table_id}/records"
         
@@ -105,7 +137,6 @@ class LarkClient:
         page_token = None
         total_processed = 0
         skipped_count = 0
-        field_names_found = set()  # Track all field names
         
         try:
             while True:
@@ -130,20 +161,13 @@ class LarkClient:
                 items = data.get('data', {}).get('items', [])
                 
                 # Filter: Only keep records with non-empty "Link air bài"
-                for idx, item in enumerate(items):
+                for item in items:
                     total_processed += 1
                     fields = item.get('fields', {})
                     
-                    # 🔍 DEBUG: Log all field names on first few records
-                    if idx < 3:  # Log first 3 records
-                        logger.info(f"🔍 Record {idx + 1} field names: {list(fields.keys())}")
-                        for field_name, value in fields.items():
-                            logger.info(f"   {field_name}: {str(value)[:100]}")
-                    
-                    field_names_found.update(fields.keys())
-                    
-                    # 🔑 FILTER: Check "Link air bài" field (exact name)
-                    link_value = fields.get("Link air bài", "").strip()
+                    # 🔑 FILTER: Check "Link air bài" field and extract value properly
+                    link_field = fields.get("Link air bài", "")
+                    link_value = self._extract_link_value(link_field)
                     
                     if not link_value:
                         skipped_count += 1
@@ -161,7 +185,6 @@ class LarkClient:
             logger.info(f"   • Total records processed: {total_processed}")
             logger.info(f"   • Records with link: {len(all_records)}")
             logger.info(f"   • Skipped (empty link): {skipped_count}")
-            logger.info(f"   • All field names found: {sorted(field_names_found)}")
             
             return all_records
             
