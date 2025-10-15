@@ -150,7 +150,7 @@ async def daily_crawl_job():
                     logger.warning(f"⚠️ Bỏ qua record {record_id}: không có link TikTok hợp lệ")
                     continue
                 
-                logger.info(f"🎬 Bắt đầu crawl qua API: {video_url}")
+                logger.info(f"🎬 Bắt đầu crawl: {video_url}")
                 
                 # Crawl views
                 result = await crawl_tiktok_views(video_url)
@@ -163,39 +163,34 @@ async def daily_crawl_job():
                 current_views = int(result["views"])
                 logger.info(f"✅ Crawl thành công: {current_views} views")
                 
-                # Get baseline views
-                baseline_views = fields.get('Số view 24h trước', 0)
-                if isinstance(baseline_views, str):
-                    baseline_views = int(baseline_views) if baseline_views.isdigit() else 0
-                elif baseline_views is None:
-                    baseline_views = 0
-                
-                # Check if need to update baseline (after 24h)
-                last_checked = fields.get("Lần kiểm tra cuối", "")
+                # Get existing record from Google Sheets
+                existing_record = sheets.get_record_by_id(record_id)
                 now = datetime.now()
-                update_baseline = False
                 
-                if last_checked:
+                if existing_record:
+                    # Record exists - check if 24h passed
+                    last_check_str = existing_record.get('last_check', '')
+                    
                     try:
-                        last_checked_clean = str(last_checked).replace("Z", "").replace("+00:00", "")
-                        if "T" in last_checked_clean:
-                            last_check_time = datetime.fromisoformat(last_checked_clean)
-                        else:
-                            last_check_time = datetime.strptime(last_checked_clean, "%Y-%m-%d %H:%M:%S")
+                        last_check_time = datetime.strptime(last_check_str, "%Y-%m-%d %H:%M:%S")
+                        hours_passed = (now - last_check_time).total_seconds() / 3600
                         
-                        if (now - last_check_time) >= timedelta(hours=24):
-                            update_baseline = True
-                    except Exception as e:
-                        logger.warning(f"Parse datetime error: {e}")
-                        update_baseline = True
+                        if hours_passed >= 24:
+                            # 24h passed - update baseline with old current_views
+                            baseline_views = existing_record.get('current_views', current_views)
+                            logger.info(f"📊 24h passed, updating baseline: {baseline_views}")
+                        else:
+                            # Keep existing baseline
+                            baseline_views = existing_record.get('baseline_views', current_views)
+                            logger.info(f"📊 Using existing baseline: {baseline_views}")
+                    except:
+                        # Can't parse datetime - use existing baseline
+                        baseline_views = existing_record.get('baseline_views', current_views)
+                        logger.info(f"📊 Parse error, using existing baseline: {baseline_views}")
                 else:
-                    # First time check
+                    # First time - use current_views as baseline
                     baseline_views = current_views
-                
-                # Update baseline if 24h passed
-                if update_baseline:
-                    old_views = fields.get("Lượt xem hiện tại", current_views)
-                    baseline_views = int(old_views) if old_views else current_views
+                    logger.info(f"🆕 First time crawl, baseline = current: {baseline_views}")
                 
                 # Write to Google Sheets
                 last_check_str = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -243,35 +238,29 @@ async def process_single_video(record_id: str, video_url: str):
         if result["success"]:
             current_views = int(result["views"])
             
-            # Get old record from Lark
-            old_record = lark.get_record(record_id)
-            fields = old_record.get("fields", {})
-            
-            last_checked = fields.get("Lần kiểm tra cuối", "")
-            baseline_views = int(fields.get("Số view 24h trước") or 0)
-            
-            # Check if 24h passed
+            # Get existing record from Google Sheets
+            existing_record = sheets.get_record_by_id(record_id)
             now = datetime.now()
-            update_baseline = False
             
-            if last_checked:
+            if existing_record:
+                # Record exists - check if 24h passed
+                last_check_str = existing_record.get('last_check', '')
+                
                 try:
-                    last_checked_clean = str(last_checked).replace("Z", "").replace("+00:00", "")
-                    if "T" in last_checked_clean:
-                        last_check_time = datetime.fromisoformat(last_checked_clean)
-                    else:
-                        last_check_time = datetime.strptime(last_checked_clean, "%Y-%m-%d %H:%M:%S")
+                    last_check_time = datetime.strptime(last_check_str, "%Y-%m-%d %H:%M:%S")
+                    hours_passed = (now - last_check_time).total_seconds() / 3600
                     
-                    if (now - last_check_time) >= timedelta(hours=24):
-                        update_baseline = True
-                except Exception as e:
-                    logger.warning(f"Parse datetime error: {e}")
-                    update_baseline = True
+                    if hours_passed >= 24:
+                        # 24h passed - update baseline
+                        baseline_views = existing_record.get('current_views', current_views)
+                    else:
+                        # Keep existing baseline
+                        baseline_views = existing_record.get('baseline_views', current_views)
+                except:
+                    baseline_views = existing_record.get('baseline_views', current_views)
             else:
+                # First time
                 baseline_views = current_views
-            
-            if update_baseline:
-                baseline_views = int(fields.get("Lượt xem hiện tại") or current_views)
             
             # Write to Google Sheets
             last_check_str = now.strftime("%Y-%m-%d %H:%M:%S")

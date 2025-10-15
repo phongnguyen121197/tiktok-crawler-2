@@ -68,6 +68,32 @@ class GoogleSheetsClient:
             logger.error(f"Error finding record {record_id}: {str(e)}")
             return None
 
+    def get_record_by_id(self, record_id: str):
+        """Get a single record by record_id"""
+        try:
+            row_num = self.find_row_by_record_id(record_id)
+            
+            if not row_num:
+                return None
+            
+            # Get the row data
+            row_data = self.worksheet.row_values(row_num)
+            
+            if len(row_data) >= 6:
+                return {
+                    'record_id': row_data[0],
+                    'link': row_data[1],
+                    'current_views': int(row_data[2]) if row_data[2] and str(row_data[2]).isdigit() else 0,
+                    'baseline_views': int(row_data[3]) if row_data[3] and str(row_data[3]).isdigit() else 0,
+                    'last_check': row_data[4] if len(row_data) > 4 else '',
+                    'status': row_data[5] if len(row_data) > 5 else 'Active'
+                }
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting record {record_id}: {str(e)}")
+            return None
+
     def update_or_append_record(self, record_id: str, link: str, 
                                 current_views: int, baseline_views: int, 
                                 last_check: str, status: str = "Active"):
