@@ -10,6 +10,7 @@ import requests
 from app.crawler import crawl_tiktok_views
 from app.lark_client import LarkClient
 from app.sheets_client import GoogleSheetsClient
+import asyncio
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -45,8 +46,8 @@ class LarkWebhookPayload(BaseModel):
 async def root():
     return {
         "message": "TikTok View Crawler API", 
-        "version": "2.0.0",
-        "mode": "Google Sheets + Lark Anycross"
+        "version": "2.0.1",
+        "mode": "Google Sheets + Lark Anycross + Background Processing"
     }
 
 @app.get("/health")
@@ -108,15 +109,29 @@ async def handle_lark_webhook(payload: LarkWebhookPayload, background_tasks: Bac
     return {"message": "Đã tiếp nhận"}
 
 @app.post("/jobs/daily")
-async def daily_crawl_job():
-    """Crawl all videos from Lark and write to Google Sheets"""
+async def daily_crawl_job(background_tasks: BackgroundTasks):
+    """Start daily crawl job in background - return immediately"""
     if not lark:
         raise HTTPException(status_code=500, detail="Lark client chưa được cấu hình")
     if not sheets:
         raise HTTPException(status_code=500, detail="Google Sheets client chưa được cấu hình")
     
+    # Start background task
+    background_tasks.add_task(run_daily_crawl)
+    
+    # Return immediately (before crawl completes)
+    logger.info("🚀 Daily crawl job started in background")
+    return {
+        "status": "started",
+        "message": "Daily crawl job started in background",
+        "note": "Check Google Sheets in 5 minutes for results",
+        "timestamp": datetime.now().isoformat()
+    }
+
+async def run_daily_crawl():
+    """The actual crawl logic - runs in background"""
     try:
-        logger.info("🚀 Bắt đầu daily crawl job")
+        logger.info("🚀 Bắt đầu daily crawl job (background)")
         
         # Read records from Lark
         records = lark.get_all_active_records()
@@ -168,7 +183,6 @@ async def daily_crawl_job():
                 now = datetime.now()
                 
                 if existing_record:
-                    # Record exists - check if 24h passed
                     last_check_str = existing_record.get('last_check', '')
                     
                     try:
@@ -176,19 +190,15 @@ async def daily_crawl_job():
                         hours_passed = (now - last_check_time).total_seconds() / 3600
                         
                         if hours_passed >= 24:
-                            # 24h passed - update baseline with old current_views
                             baseline_views = existing_record.get('current_views', current_views)
                             logger.info(f"📊 24h passed, updating baseline: {baseline_views}")
                         else:
-                            # Keep existing baseline
                             baseline_views = existing_record.get('baseline_views', current_views)
                             logger.info(f"📊 Using existing baseline: {baseline_views}")
                     except:
-                        # Can't parse datetime - use existing baseline
                         baseline_views = existing_record.get('baseline_views', current_views)
                         logger.info(f"📊 Parse error, using existing baseline: {baseline_views}")
                 else:
-                    # First time - use current_views as baseline
                     baseline_views = current_views
                     logger.info(f"🆕 First time crawl, baseline = current: {baseline_views}")
                 
@@ -209,7 +219,6 @@ async def daily_crawl_job():
                     logger.info(f"✅ Updated {record_id}: {current_views} views (baseline: {baseline_views})")
                 else:
                     error_count += 1
-                    logger.error(f"❌ Failed to write to Sheets: {record_id}")
                     
             except Exception as e:
                 logger.error(f"❌ Lỗi xử lý record {record_id}: {str(e)}")
@@ -218,17 +227,8 @@ async def daily_crawl_job():
         
         logger.info(f"🎉 Hoàn thành crawl: {success_count} thành công, {error_count} lỗi")
         
-        return {
-            "status": "completed",
-            "total_records": len(records),
-            "success": success_count,
-            "errors": error_count,
-            "note": "Dữ liệu đã ghi vào Google Sheets. Dùng Lark Anycross để sync sang Bitable."
-        }
-        
     except Exception as e:
-        logger.error(f"❌ Job failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"❌ Background job failed: {str(e)}")
 
 async def process_single_video(record_id: str, video_url: str):
     """Process single video (for webhook)"""
@@ -243,7 +243,6 @@ async def process_single_video(record_id: str, video_url: str):
             now = datetime.now()
             
             if existing_record:
-                # Record exists - check if 24h passed
                 last_check_str = existing_record.get('last_check', '')
                 
                 try:
@@ -251,15 +250,12 @@ async def process_single_video(record_id: str, video_url: str):
                     hours_passed = (now - last_check_time).total_seconds() / 3600
                     
                     if hours_passed >= 24:
-                        # 24h passed - update baseline
                         baseline_views = existing_record.get('current_views', current_views)
                     else:
-                        # Keep existing baseline
                         baseline_views = existing_record.get('baseline_views', current_views)
                 except:
                     baseline_views = existing_record.get('baseline_views', current_views)
             else:
-                # First time
                 baseline_views = current_views
             
             # Write to Google Sheets
