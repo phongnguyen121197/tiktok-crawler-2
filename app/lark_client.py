@@ -97,7 +97,7 @@ class LarkClient:
     def get_all_active_records(self):
         """
         Get all records with non-empty "Link air bài" field from Lark Bitable
-        Filters out records where link is empty
+        DEBUG MODE: Logs all field names to identify correct field name
         """
         url = f"https://open.larksuite.com/open-apis/bitable/v1/apps/{self.bitable_app_token}/tables/{self.table_id}/records"
         
@@ -105,6 +105,7 @@ class LarkClient:
         page_token = None
         total_processed = 0
         skipped_count = 0
+        field_names_found = set()  # Track all field names
         
         try:
             while True:
@@ -129,11 +130,19 @@ class LarkClient:
                 items = data.get('data', {}).get('items', [])
                 
                 # Filter: Only keep records with non-empty "Link air bài"
-                for item in items:
+                for idx, item in enumerate(items):
                     total_processed += 1
                     fields = item.get('fields', {})
                     
-                    # 🔑 FILTER: Check "Link air bài" field
+                    # 🔍 DEBUG: Log all field names on first few records
+                    if idx < 3:  # Log first 3 records
+                        logger.info(f"🔍 Record {idx + 1} field names: {list(fields.keys())}")
+                        for field_name, value in fields.items():
+                            logger.info(f"   {field_name}: {str(value)[:100]}")
+                    
+                    field_names_found.update(fields.keys())
+                    
+                    # 🔑 FILTER: Check "Link air bài" field (exact name)
                     link_value = fields.get("Link air bài", "").strip()
                     
                     if not link_value:
@@ -152,6 +161,7 @@ class LarkClient:
             logger.info(f"   • Total records processed: {total_processed}")
             logger.info(f"   • Records with link: {len(all_records)}")
             logger.info(f"   • Skipped (empty link): {skipped_count}")
+            logger.info(f"   • All field names found: {sorted(field_names_found)}")
             
             return all_records
             
