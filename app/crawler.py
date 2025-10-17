@@ -2,7 +2,8 @@ import requests
 import logging
 from typing import List, Dict
 from datetime import datetime
-import json
+import re
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -13,77 +14,155 @@ class TikTokCrawler:
         """
         self.lark_client = lark_client
         self.sheets_client = sheets_client
-        self.tikwm_api = "https://api.tikvideo.top/api"
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
         
     def extract_video_id_from_url(self, url: str) -> str:
         """Extract TikTok video ID from URL"""
         try:
-            # Extract video ID from various TikTok URL formats
-            # Format 1: https://www.tiktok.com/@username/video/7547723768194518279
-            # Format 2: https://www.tiktok.com/@username/video/7547723768194518279?...params
-            
             if '/video/' in url:
                 video_id = url.split('/video/')[1]
-                # Remove query parameters if any
                 if '?' in video_id:
                     video_id = video_id.split('?')[0]
                 return video_id.strip()
             
-            logger.warning(f"⚠️ Could not extract video ID from: {url}")
+            logger.warning(f"Could not extract video ID from: {url}")
             return None
             
         except Exception as e:
-            logger.error(f"❌ Error extracting video ID: {e}")
+            logger.error(f"Error extracting video ID: {e}")
             return None
     
-    def get_tiktok_views(self, video_url: str) -> Dict:
+    def get_tiktok_views_from_og_tags(self, video_url: str) -> Dict:
         """
-        Get TikTok video stats using TikWM API
-        Returns: {views: int, likes: int, comments: int, shares: int}
+        Get TikTok video stats from Open Graph meta tags
+        Returns: {views: int, status: 'success'/'partial'/'failed'}
         """
         try:
-            video_id = self.extract_video_id_from_url(video_url)
+            # Normalize URL
+            if not video_url.startswith('http'):
+                video_url = 'https://' + video_url
             
-            if not video_id:
-                logger.warning(f"⚠️ Invalid TikTok URL: {video_url}")
-                return None
+            logger.debug(f"Fetching OG tags from: {video_url}")
             
-            # Call TikWM API
-            params = {
-                'url': f'https://www.tiktok.com/video/{video_id}'
-            }
-            
-            response = requests.get(self.tikwm_api, params=params, timeout=15)
+            # Fetch page with timeout
+            response = self.session.get(
+                video_url,
+                timeout=10,
+                allow_redirects=True,
+                verify=False  # Ignore SSL cert issues
+            )
             response.raise_for_status()
             
-            data = response.json()
+            # Parse HTML
+            soup = BeautifulSoup(response.content, 'html.parser')
             
-            if data.get('code') == 0 and data.get('data'):
-                video_data = data['data']['video']
-                stats = {
-                    'views': video_data.get('playCount', 0),
-                    'likes': video_data.get('diggCount', 0),
-                    'comments': video_data.get('commentCount', 0),
-                    'shares': video_data.get('shareCount', 0)
+            # Try to find view count in various meta tags
+            views = None
+            
+            # Method 1: Look for og:description which often contains view count
+            og_description = soup.find('meta', property='og:description')
+            if og_description and og_description.get('content'):
+                desc = og_description['content']
+                # Pattern: "123.4K Likes, 456 Comments, 789.1K Shares"
+                # Or: "123K views"
+                views_match = re.search(r'(\d+[.,]?\d*)\s*[KMB]?\s*(?:views?|plays?)', desc, re.IGNORECASE)
+                if views_match:
+                    views_str = views_match.group(1).replace(',', '.')
+                    views = self._convert_to_int(views_str)
+                    logger.debug(f"Found views in og:description: {views}")
+            
+            # Method 2: Look for structured data (JSON-LD)
+            if not views:
+                scripts = soup.find_all('script', type='application/ld+json')
+                for script in scripts:
+                    try:
+                        import json
+                        data = json.loads(script.string)
+                        if isinstance(data, dict):
+                            # Look for VideoObject
+                            if data.get('@type') == 'VideoObject' and 'interactionCount' in data:
+                                interaction = data['interactionCount']
+                                if isinstance(interaction, dict):
+                                    views = int(interaction.get('UserPlayss', 0))
+                                    logger.debug(f"Found views in JSON-LD: {views}")
+                                    break
+                    except:
+                        pass
+            
+            # Method 3: Look for specific meta tags
+            if not views:
+                for tag_name in ['twitter:text:views', 'tiktok:views']:
+                    tag = soup.find('meta', property=tag_name)
+                    if tag and tag.get('content'):
+                        views = self._convert_to_int(tag['content'])
+                        if views:
+                            logger.debug(f"Found views in {tag_name}: {views}")
+                            break
+            
+            # Method 4: Regex search in page title or other text
+            if not views:
+                title = soup.find('title')
+                if title:
+                    title_text = title.get_text()
+                    # Try to find view count in title
+                    match = re.search(r'(\d+[.,]?\d*[KMB]?)\s*views?', title_text, re.IGNORECASE)
+                    if match:
+                        views = self._convert_to_int(match.group(1))
+                        logger.debug(f"Found views in title: {views}")
+            
+            if views and views > 0:
+                return {
+                    'views': views,
+                    'status': 'success',
+                    'source': 'og_tags'
                 }
-                logger.debug(f"✅ Got TikTok stats for {video_id}: {stats['views']} views")
-                return stats
             else:
-                logger.warning(f"⚠️ TikWM API error: {data}")
-                return None
+                # Could not extract views, but URL is valid
+                logger.warning(f"Could not extract view count from {video_url}")
+                return {
+                    'views': 0,
+                    'status': 'partial',
+                    'source': 'og_tags'
+                }
                 
         except requests.exceptions.Timeout:
-            logger.warning(f"⏱️ TikWM API timeout for: {video_url}")
-            return None
+            logger.warning(f"Timeout fetching {video_url}")
+            return {'views': 0, 'status': 'timeout', 'source': 'og_tags'}
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"Connection error for {video_url}")
+            return {'views': 0, 'status': 'connection_error', 'source': 'og_tags'}
         except Exception as e:
-            logger.error(f"❌ Error getting TikTok views: {e}")
-            return None
+            logger.error(f"Error getting TikTok views: {e}")
+            return {'views': 0, 'status': 'error', 'source': 'og_tags'}
+    
+    def _convert_to_int(self, value_str: str) -> int:
+        """Convert string like '1.2M' or '500K' to integer"""
+        try:
+            if not value_str:
+                return 0
+            
+            value_str = str(value_str).strip().upper()
+            
+            # Remove commas
+            value_str = value_str.replace(',', '')
+            
+            # Check for multipliers
+            if 'M' in value_str:
+                return int(float(value_str.replace('M', '')) * 1_000_000)
+            elif 'K' in value_str:
+                return int(float(value_str.replace('K', '')) * 1_000)
+            elif 'B' in value_str:
+                return int(float(value_str.replace('B', '')) * 1_000_000_000)
+            else:
+                return int(float(value_str))
+        except:
+            return 0
     
     def extract_lark_field_value(self, field_data, field_type: str = 'text'):
-        """
-        Extract value from Lark field (handles different formats)
-        Formats: text, number, link, array
-        """
+        """Extract value from Lark field (handles different formats)"""
         try:
             if not field_data:
                 return None
@@ -126,14 +205,11 @@ class TikTokCrawler:
                 return str(field_data).strip() if field_data else None
                 
         except Exception as e:
-            logger.warning(f"⚠️ Error extracting field value: {e}")
+            logger.warning(f"Error extracting field value: {e}")
             return None
     
     def process_lark_record(self, lark_record: Dict) -> Dict:
-        """
-        Process Lark record and extract relevant data for Google Sheets
-        Returns: {record_id, link, views, baseline, status, source_data}
-        """
+        """Process Lark record and extract relevant data for Google Sheets"""
         try:
             fields = lark_record.get('fields', {})
             record_id = lark_record.get('id', '')
@@ -143,7 +219,7 @@ class TikTokCrawler:
             link_value = self.extract_lark_field_value(link_field, 'link')
             
             if not link_value:
-                logger.warning(f"⚠️ Record {record_id} has no link, skipping")
+                logger.warning(f"Record {record_id} has no link, skipping")
                 return None
             
             # Extract Current Views from Lark
@@ -154,56 +230,54 @@ class TikTokCrawler:
             baseline_lark = fields.get('Số view 24h trước', [])
             baseline_value = self.extract_lark_field_value(baseline_lark, 'number')
             
-            # Get current views from TikWM API
-            tiktok_stats = self.get_tiktok_views(link_value)
+            # Get current views from TikTok OG tags
+            tiktok_data = self.get_tiktok_views_from_og_tags(link_value)
             
-            if tiktok_stats:
-                current_views = tiktok_stats.get('views', views_lark or 0)
+            if tiktok_data['status'] == 'success' and tiktok_data['views'] > 0:
+                current_views = tiktok_data['views']
+                status = 'success'
             else:
+                # Fallback to Lark data
                 current_views = views_lark or 0
+                status = 'partial'  # Using Lark data, not crawled from TikTok
             
-            # Use Lark baseline, or calculate from Lark data
+            # Use Lark baseline, or current views if no baseline
             if baseline_value:
                 baseline = baseline_value
             else:
-                baseline = views_lark or 0
+                baseline = views_lark or current_views or 0
             
             processed_record = {
                 'record_id': record_id,
                 'link': link_value,
                 'views': current_views,
                 'baseline': baseline,
-                'status': 'success' if tiktok_stats else 'partial',
+                'status': status,
                 'source_data': {
                     'lark_views': views_lark,
                     'lark_baseline': baseline_value,
-                    'tiktok_stats': tiktok_stats
+                    'crawled_views': tiktok_data['views'] if tiktok_data['status'] == 'success' else None
                 }
             }
             
-            logger.debug(f"✅ Processed record {record_id}: {current_views} views")
+            logger.debug(f"Processed record {record_id}: {current_views} views (status: {status})")
             return processed_record
             
         except Exception as e:
-            logger.error(f"❌ Error processing Lark record: {e}")
+            logger.error(f"Error processing Lark record: {e}")
             return None
     
     def crawl_all_videos(self) -> Dict:
-        """
-        Main crawler function
-        1. Get all active records from Lark
-        2. Process each record (crawl views)
-        3. Update/Insert into Google Sheets with deduplication
-        """
+        """Main crawler function"""
         try:
-            logger.info("🚀 Starting TikTok crawler...")
+            logger.info("Starting TikTok crawler...")
             
             # Step 1: Get records from Lark
-            logger.info("📋 Fetching records from Lark Bitable...")
+            logger.info("Fetching records from Lark Bitable...")
             lark_records = self.lark_client.get_all_active_records()
             
             if not lark_records:
-                logger.error("❌ No records found in Lark")
+                logger.error("No records found in Lark")
                 return {
                     'success': False,
                     'message': 'No records found in Lark',
@@ -216,10 +290,10 @@ class TikTokCrawler:
                     }
                 }
             
-            logger.info(f"✅ Fetched {len(lark_records)} records from Lark")
+            logger.info(f"Fetched {len(lark_records)} records from Lark")
             
             # Step 2: Process each record
-            logger.info("🔄 Processing records and crawling views...")
+            logger.info("Processing records and crawling views...")
             processed_records = []
             failed_count = 0
             
@@ -233,13 +307,13 @@ class TikTokCrawler:
                     else:
                         failed_count += 1
                 except Exception as e:
-                    logger.error(f"❌ Error processing record {idx}: {e}")
+                    logger.error(f"Error processing record {idx}: {e}")
                     failed_count += 1
             
-            logger.info(f"✅ Processed {len(processed_records)} records, {failed_count} failed")
+            logger.info(f"Processed {len(processed_records)} records, {failed_count} failed")
             
             # Step 3: Update/Insert into Google Sheets with deduplication
-            logger.info("📊 Updating Google Sheets with deduplication...")
+            logger.info("Updating Google Sheets with deduplication...")
             updated, inserted = self.sheets_client.batch_update_records(processed_records)
             
             result = {
@@ -254,11 +328,11 @@ class TikTokCrawler:
                 }
             }
             
-            logger.info(f"✅ Crawler completed: {result['stats']}")
+            logger.info(f"Crawler completed: {result['stats']}")
             return result
             
         except Exception as e:
-            logger.error(f"❌ Crawler failed: {e}")
+            logger.error(f"Crawler failed: {e}")
             return {
                 'success': False,
                 'message': str(e),
@@ -272,12 +346,9 @@ class TikTokCrawler:
             }
     
     def crawl_videos_batch(self, record_ids: List[str] = None) -> Dict:
-        """
-        Crawl specific videos by Record IDs (optional)
-        If record_ids is None, crawl all
-        """
+        """Crawl specific videos by Record IDs"""
         try:
-            logger.info("🚀 Starting batch crawler...")
+            logger.info("Starting batch crawler...")
             
             # Get all records
             all_records = self.lark_client.get_all_active_records()
@@ -285,7 +356,7 @@ class TikTokCrawler:
             # Filter if specific IDs provided
             if record_ids:
                 lark_records = [r for r in all_records if r.get('id') in record_ids]
-                logger.info(f"🔍 Filtered to {len(lark_records)} records")
+                logger.info(f"Filtered to {len(lark_records)} records")
             else:
                 lark_records = all_records
             
@@ -311,5 +382,5 @@ class TikTokCrawler:
             }
             
         except Exception as e:
-            logger.error(f"❌ Batch crawl failed: {e}")
+            logger.error(f"Batch crawl failed: {e}")
             return {'success': False, 'message': str(e)}
