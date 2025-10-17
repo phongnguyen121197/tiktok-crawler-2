@@ -6,8 +6,8 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 import logging
 from datetime import datetime, timedelta
-import requests
-from app.crawler import crawl_tiktok_views
+import json
+from app.crawler import TikTokCrawler
 from app.lark_client import LarkClient
 from app.sheets_client import GoogleSheetsClient
 import asyncio
@@ -17,37 +17,75 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="TikTok View Crawler")
 
-# Initialize Lark client
-try:
-    lark = LarkClient(
-        app_id=os.getenv("LARK_APP_ID"),
-        app_secret=os.getenv("LARK_APP_SECRET"),
-        bitable_app_token=os.getenv("LARK_BITABLE_TOKEN"),
-        table_id=os.getenv("LARK_TABLE_ID")
-    )
-    logger.info("✅ Lark client khởi tạo thành công")
-except Exception as e:
-    logger.error(f"❌ Không thể khởi tạo Lark client: {e}")
-    lark = None
+# Global clients
+lark_client = None
+sheets_client = None
+crawler = None
 
-# Initialize Google Sheets client
-try:
-    sheets = GoogleSheetsClient()
-    logger.info("✅ Google Sheets client khởi tạo thành công")
-except Exception as e:
-    logger.error(f"❌ Không thể khởi tạo Google Sheets client: {e}")
-    sheets = None
+def init_clients():
+    """Initialize all clients at startup"""
+    global lark_client, sheets_client, crawler
+    
+    try:
+        # Initialize Lark client
+        lark_client = LarkClient(
+            app_id=os.getenv("LARK_APP_ID"),
+            app_secret=os.getenv("LARK_APP_SECRET"),
+            bitable_app_token=os.getenv("LARK_BITABLE_TOKEN"),
+            table_id=os.getenv("LARK_TABLE_ID")
+        )
+        logger.info("✅ Lark client initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize Lark client: {e}")
+        lark_client = None
 
-class LarkWebhookPayload(BaseModel):
-    record_id: str
-    video_url: str
+    try:
+        # Initialize Google Sheets client
+        google_credentials_json_str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+        google_sheet_id = os.getenv("GOOGLE_SHEET_ID")
+        
+        if google_credentials_json_str and google_sheet_id:
+            google_credentials = json.loads(google_credentials_json_str)
+            sheets_client = GoogleSheetsClient(
+                credentials_json=google_credentials,
+                sheet_id=google_sheet_id
+            )
+            logger.info("✅ Google Sheets client initialized successfully")
+        else:
+            logger.error("❌ Missing Google Sheets credentials or sheet ID")
+            sheets_client = None
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize Google Sheets client: {e}")
+        sheets_client = None
+    
+    try:
+        # Initialize TikTok crawler
+        if lark_client and sheets_client:
+            crawler = TikTokCrawler(
+                lark_client=lark_client,
+                sheets_client=sheets_client
+            )
+            logger.info("✅ TikTok crawler initialized successfully")
+        else:
+            logger.error("❌ Cannot initialize crawler - missing dependencies")
+            crawler = None
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize crawler: {e}")
+        crawler = None
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize clients on startup"""
+    logger.info("🚀 Application starting up...")
+    init_clients()
+    logger.info("✅ Application ready")
 
 @app.get("/")
 async def root():
     return {
         "message": "TikTok View Crawler API", 
-        "version": "2.0.1",
-        "mode": "Google Sheets + Lark Anycross + Background Processing"
+        "version": "2.1.0",
+        "mode": "Google Sheets + Lark Bitable + Deduplication"
     }
 
 @app.get("/health")
@@ -55,223 +93,145 @@ async def health_check():
     return {
         "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
-        "lark_connected": lark is not None,
-        "sheets_connected": sheets is not None
+        "lark_connected": lark_client is not None,
+        "sheets_connected": sheets_client is not None,
+        "crawler_ready": crawler is not None
     }
 
 @app.get("/test")
 async def test():
-    return {"message": "Test endpoint works"}
-
-@app.get("/test/crawl")
-async def test_crawl_endpoint(url: str):
-    logger.info(f"Testing crawl: {url}")
-    result = await crawl_tiktok_views(url)
-    return result
+    return {"message": "Test endpoint works", "timestamp": datetime.now().isoformat()}
 
 @app.get("/test/lark")
 async def test_lark_connection():
-    if not lark:
-        return {"error": "Lark client chưa được cấu hình"}
+    """Test Lark Bitable connection"""
+    if not lark_client:
+        logger.error("Lark client not initialized")
+        return {"success": False, "error": "Lark client not configured"}
     
     try:
-        records = lark.get_all_active_records()
+        records = lark_client.get_all_active_records()
         return {
             "success": True,
             "total_records": len(records),
-            "sample_records": records[:3] if len(records) > 0 else []
+            "message": f"Retrieved {len(records)} active records from Lark",
+            "sample_records": records[:2] if len(records) > 0 else []
         }
     except Exception as e:
+        logger.error(f"Error testing Lark: {e}")
         return {"success": False, "error": str(e)}
 
 @app.get("/test/sheets")
 async def test_sheets_connection():
     """Test Google Sheets connection"""
-    if not sheets:
-        return {"error": "Google Sheets client chưa được cấu hình"}
+    if not sheets_client:
+        logger.error("Sheets client not initialized")
+        return {"success": False, "error": "Sheets client not configured"}
     
     try:
-        records = sheets.get_all_records()
+        record_index = sheets_client.get_all_records_with_index()
         return {
             "success": True,
-            "total_records": len(records),
-            "sample_records": records[:3] if records else []
+            "total_records": len(record_index),
+            "message": f"Retrieved {len(record_index)} records from Google Sheets",
+            "sample_records": list(record_index.keys())[:5]
         }
     except Exception as e:
+        logger.error(f"Error testing Sheets: {e}")
         return {"success": False, "error": str(e)}
-
-@app.post("/webhooks/lark")
-async def handle_lark_webhook(payload: LarkWebhookPayload, background_tasks: BackgroundTasks):
-    if not lark or not sheets:
-        return {"error": "Clients chưa được cấu hình"}
-    logger.info(f"Nhận webhook: {payload.record_id}")
-    background_tasks.add_task(process_single_video, payload.record_id, payload.video_url)
-    return {"message": "Đã tiếp nhận"}
 
 @app.post("/jobs/daily")
 async def daily_crawl_job(background_tasks: BackgroundTasks):
-    """Start daily crawl job in background - return immediately"""
-    if not lark:
-        raise HTTPException(status_code=500, detail="Lark client chưa được cấu hình")
-    if not sheets:
-        raise HTTPException(status_code=500, detail="Google Sheets client chưa được cấu hình")
+    """Trigger daily crawler job - runs in background"""
+    
+    if not lark_client:
+        raise HTTPException(status_code=500, detail="Lark client not initialized")
+    if not sheets_client:
+        raise HTTPException(status_code=500, detail="Sheets client not initialized")
+    if not crawler:
+        raise HTTPException(status_code=500, detail="Crawler not initialized")
     
     # Start background task
     background_tasks.add_task(run_daily_crawl)
     
-    # Return immediately (before crawl completes)
     logger.info("🚀 Daily crawl job started in background")
     return {
+        "success": True,
         "status": "started",
-        "message": "Daily crawl job started in background",
-        "note": "Check Google Sheets in 5 minutes for results",
+        "message": "Daily crawler job started in background",
+        "note": "Check Google Sheets in 5-10 minutes for results",
         "timestamp": datetime.now().isoformat()
     }
 
 async def run_daily_crawl():
-    """The actual crawl logic - runs in background"""
+    """Main crawler logic - runs in background"""
     try:
-        logger.info("🚀 Bắt đầu daily crawl job (background)")
+        logger.info("🚀 Starting daily crawl (background job)")
         
-        # Read records from Lark
-        records = lark.get_all_active_records()
-        logger.info(f"📊 Tìm thấy {len(records)} records từ Lark Bitable")
+        # Run crawler
+        result = crawler.crawl_all_videos()
         
-        success_count = 0
-        error_count = 0
-        
-        for record in records:
-            try:
-                record_id = record.get('record_id')
-                fields = record.get('fields', {})
-                
-                # Get TikTok link
-                link_field = fields.get('Link air bài')
-                
-                # Extract URL
-                video_url = None
-                if isinstance(link_field, str):
-                    video_url = link_field
-                elif isinstance(link_field, dict):
-                    video_url = link_field.get("link") or link_field.get("text")
-                elif isinstance(link_field, list) and len(link_field) > 0:
-                    first = link_field[0]
-                    if isinstance(first, dict):
-                        video_url = first.get("text") or first.get("link")
-                    elif isinstance(first, str):
-                        video_url = first
-                
-                if not video_url or 'tiktok.com' not in video_url:
-                    logger.warning(f"⚠️ Bỏ qua record {record_id}: không có link TikTok hợp lệ")
-                    continue
-                
-                logger.info(f"🎬 Bắt đầu crawl: {video_url}")
-                
-                # Crawl views
-                result = await crawl_tiktok_views(video_url)
-                
-                if not result.get("success"):
-                    logger.warning(f"⚠️ Không crawl được: {video_url}")
-                    error_count += 1
-                    continue
-                
-                current_views = int(result["views"])
-                logger.info(f"✅ Crawl thành công: {current_views} views")
-                
-                # Get existing record from Google Sheets
-                existing_record = sheets.get_record_by_id(record_id)
-                now = datetime.now()
-                
-                if existing_record:
-                    last_check_str = existing_record.get('last_check', '')
-                    
-                    try:
-                        last_check_time = datetime.strptime(last_check_str, "%Y-%m-%d %H:%M:%S")
-                        hours_passed = (now - last_check_time).total_seconds() / 3600
-                        
-                        if hours_passed >= 24:
-                            baseline_views = existing_record.get('current_views', current_views)
-                            logger.info(f"📊 24h passed, updating baseline: {baseline_views}")
-                        else:
-                            baseline_views = existing_record.get('baseline_views', current_views)
-                            logger.info(f"📊 Using existing baseline: {baseline_views}")
-                    except:
-                        baseline_views = existing_record.get('baseline_views', current_views)
-                        logger.info(f"📊 Parse error, using existing baseline: {baseline_views}")
-                else:
-                    baseline_views = current_views
-                    logger.info(f"🆕 First time crawl, baseline = current: {baseline_views}")
-                
-                # Write to Google Sheets
-                last_check_str = now.strftime("%Y-%m-%d %H:%M:%S")
-                
-                sheets_success = sheets.update_or_append_record(
-                    record_id=record_id,
-                    link=video_url,
-                    current_views=current_views,
-                    baseline_views=baseline_views,
-                    last_check=last_check_str,
-                    status="Active"
-                )
-                
-                if sheets_success:
-                    success_count += 1
-                    logger.info(f"✅ Updated {record_id}: {current_views} views (baseline: {baseline_views})")
-                else:
-                    error_count += 1
-                    
-            except Exception as e:
-                logger.error(f"❌ Lỗi xử lý record {record_id}: {str(e)}")
-                error_count += 1
-                continue
-        
-        logger.info(f"🎉 Hoàn thành crawl: {success_count} thành công, {error_count} lỗi")
+        logger.info(f"✅ Daily crawl completed: {result}")
         
     except Exception as e:
-        logger.error(f"❌ Background job failed: {str(e)}")
+        logger.error(f"❌ Daily crawl failed: {e}")
 
-async def process_single_video(record_id: str, video_url: str):
-    """Process single video (for webhook)"""
+@app.get("/status")
+async def get_status():
+    """Get system status"""
     try:
-        result = await crawl_tiktok_views(video_url)
+        lark_ok = lark_client is not None
+        sheets_ok = sheets_client is not None
+        crawler_ok = crawler is not None
         
-        if result["success"]:
-            current_views = int(result["views"])
-            
-            # Get existing record from Google Sheets
-            existing_record = sheets.get_record_by_id(record_id)
-            now = datetime.now()
-            
-            if existing_record:
-                last_check_str = existing_record.get('last_check', '')
-                
-                try:
-                    last_check_time = datetime.strptime(last_check_str, "%Y-%m-%d %H:%M:%S")
-                    hours_passed = (now - last_check_time).total_seconds() / 3600
-                    
-                    if hours_passed >= 24:
-                        baseline_views = existing_record.get('current_views', current_views)
-                    else:
-                        baseline_views = existing_record.get('baseline_views', current_views)
-                except:
-                    baseline_views = existing_record.get('baseline_views', current_views)
-            else:
-                baseline_views = current_views
-            
-            # Write to Google Sheets
-            last_check_str = now.strftime("%Y-%m-%d %H:%M:%S")
-            
-            sheets.update_or_append_record(
-                record_id=record_id,
-                link=video_url,
-                current_views=current_views,
-                baseline_views=baseline_views,
-                last_check=last_check_str,
-                status="Active"
-            )
-            
-            logger.info(f"✅ Updated {record_id}: {current_views} views (baseline: {baseline_views})")
-        else:
-            logger.warning(f"⚠️ Failed to crawl {record_id}")
+        return {
+            "status": "ok" if all([lark_ok, sheets_ok, crawler_ok]) else "degraded",
+            "services": {
+                "lark": "✅ ready" if lark_ok else "❌ not initialized",
+                "sheets": "✅ ready" if sheets_ok else "❌ not initialized",
+                "crawler": "✅ ready" if crawler_ok else "❌ not initialized"
+            },
+            "timestamp": datetime.now().isoformat()
+        }
     except Exception as e:
-        logger.error(f"❌ Lỗi process_single_video: {e}")
+        logger.error(f"Error getting status: {e}")
+        return {"status": "error", "message": str(e)}, 500
+
+class CrawlRequest(BaseModel):
+    """Manual crawl request model"""
+    record_ids: list = None
+
+@app.post("/jobs/crawl-batch")
+async def crawl_batch(request: CrawlRequest, background_tasks: BackgroundTasks):
+    """Crawl specific records by IDs"""
+    
+    if not crawler:
+        raise HTTPException(status_code=500, detail="Crawler not initialized")
+    
+    async def batch_task():
+        try:
+            result = crawler.crawl_videos_batch(record_ids=request.record_ids)
+            logger.info(f"✅ Batch crawl completed: {result}")
+        except Exception as e:
+            logger.error(f"❌ Batch crawl failed: {e}")
+    
+    background_tasks.add_task(batch_task)
+    
+    logger.info(f"📋 Batch crawl job started for {len(request.record_ids) if request.record_ids else 'all'} records")
+    return {
+        "success": True,
+        "message": "Batch crawl job started",
+        "record_count": len(request.record_ids) if request.record_ids else "all",
+        "timestamp": datetime.now().isoformat()
+    }
+
+# Error handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    """Global exception handler"""
+    logger.error(f"❌ Unhandled exception: {exc}")
+    return {
+        "success": False,
+        "message": "Internal server error",
+        "error": str(exc)
+    }
