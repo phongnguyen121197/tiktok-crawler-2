@@ -1,136 +1,178 @@
 import gspread
 from google.oauth2.service_account import Credentials
-import os
-import json
-from datetime import datetime
 import logging
+from datetime import datetime
+from typing import Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
 class GoogleSheetsClient:
-    def __init__(self):
+    def __init__(self, credentials_json, sheet_id):
         """Initialize Google Sheets client"""
         try:
-            # Define the scope
-            scope = [
-                'https://www.googleapis.com/auth/spreadsheets',
-                'https://www.googleapis.com/auth/drive'
-            ]
+            # Load credentials
+            creds = Credentials.from_service_account_info(
+                credentials_json,
+                scopes=['https://www.googleapis.com/auth/spreadsheets']
+            )
             
-            # Try to read credentials from environment variable (for Railway)
-            credentials_json = os.getenv('GOOGLE_APPLICATION_CREDENTIALS_JSON')
-            
-            if credentials_json:
-                # On Railway - read from env variable
-                logger.info("📦 Loading credentials from environment variable")
-                creds_dict = json.loads(credentials_json)
-                creds = Credentials.from_service_account_info(
-                    creds_dict,
-                    scopes=scope
-                )
-            else:
-                # Local - read from file
-                logger.info("📁 Loading credentials from file")
-                creds = Credentials.from_service_account_file(
-                    'credentials.json',
-                    scopes=scope
-                )
-            
-            # Authorize the client
             self.client = gspread.authorize(creds)
-            
-            # Open the spreadsheet
-            self.sheet_id = os.getenv('GOOGLE_SHEET_ID')
-            if not self.sheet_id:
-                raise ValueError("GOOGLE_SHEET_ID environment variable is not set")
-            
-            self.spreadsheet = self.client.open_by_key(self.sheet_id)
-            self.worksheet = self.spreadsheet.sheet1  # First sheet
+            self.sheet_id = sheet_id
+            self.sheet = self.client.open_by_key(sheet_id)
+            self.worksheet = self.sheet.sheet1  # First sheet
             
             logger.info("✅ Google Sheets client initialized successfully")
-            
         except Exception as e:
-            logger.error(f"❌ Failed to initialize Google Sheets: {str(e)}")
+            logger.error(f"❌ Error initializing Google Sheets: {e}")
             raise
-
-    def find_row_by_record_id(self, record_id: str) -> int:
-        """Find row number by record_id (column A)"""
+    
+    def get_all_records_with_index(self) -> Dict[str, int]:
+        """
+        Get all records from Google Sheets
+        Returns: {record_id: row_number}
+        """
         try:
-            # Get all values in column A (Record ID)
-            record_ids = self.worksheet.col_values(1)
+            all_values = self.worksheet.get_all_values()
             
-            # Find the row (index + 1 because sheets are 1-indexed)
-            if record_id in record_ids:
-                return record_ids.index(record_id) + 1
-            return None
+            record_index = {}
+            # Skip header row (row 1)
+            for idx, row in enumerate(all_values[1:], start=2):
+                if len(row) > 0 and row[0].strip():  # Column A = Record ID
+                    record_id = row[0].strip()
+                    record_index[record_id] = idx
+            
+            logger.info(f"✅ Loaded {len(record_index)} existing records from Google Sheets")
+            return record_index
             
         except Exception as e:
-            logger.error(f"Error finding record {record_id}: {str(e)}")
-            return None
-
-    def get_record_by_id(self, record_id: str):
-        """Get a single record by record_id"""
+            logger.error(f"❌ Error reading Google Sheets: {e}")
+            return {}
+    
+    def remove_duplicates(self):
+        """
+        Remove duplicate records by Record ID
+        Keep the latest record (highest row number), delete older ones
+        """
         try:
-            row_num = self.find_row_by_record_id(record_id)
+            all_values = self.worksheet.get_all_values()
             
-            if not row_num:
-                return None
+            # Build dict: record_id -> list of row numbers
+            record_occurrences = {}
+            for idx, row in enumerate(all_values[1:], start=2):
+                if len(row) > 0 and row[0].strip():
+                    record_id = row[0].strip()
+                    if record_id not in record_occurrences:
+                        record_occurrences[record_id] = []
+                    record_occurrences[record_id].append(idx)
             
-            # Get the row data
-            row_data = self.worksheet.row_values(row_num)
+            # Find duplicates
+            rows_to_delete = []
+            duplicates_found = 0
             
-            if len(row_data) >= 6:
-                return {
-                    'record_id': row_data[0],
-                    'link': row_data[1],
-                    'current_views': int(row_data[2]) if row_data[2] and str(row_data[2]).isdigit() else 0,
-                    'baseline_views': int(row_data[3]) if row_data[3] and str(row_data[3]).isdigit() else 0,
-                    'last_check': row_data[4] if len(row_data) > 4 else '',
-                    'status': row_data[5] if len(row_data) > 5 else 'Active'
-                }
-            return None
+            for record_id, row_numbers in record_occurrences.items():
+                if len(row_numbers) > 1:
+                    # Keep the latest (highest row number), mark others for deletion
+                    duplicates_found += len(row_numbers) - 1
+                    rows_to_delete.extend(sorted(row_numbers[:-1], reverse=True))
             
-        except Exception as e:
-            logger.error(f"Error getting record {record_id}: {str(e)}")
-            return None
-
-    def update_or_append_record(self, record_id: str, link: str, 
-                                current_views: int, baseline_views: int, 
-                                last_check: str, status: str = "Active"):
-        """Update existing record or append new one"""
-        try:
-            row_num = self.find_row_by_record_id(record_id)
-            
-            row_data = [
-                record_id,           # A: Record ID
-                link,                # B: Link TikTok
-                current_views,       # C: Lượt xem hiện tại
-                baseline_views,      # D: Số view 24h trước
-                last_check,          # E: Lần kiểm tra cuối
-                status               # F: Status
-            ]
-            
-            if row_num:
-                # Update existing row
-                self.worksheet.update(f'A{row_num}:F{row_num}', [row_data])
-                logger.info(f"✅ Updated row {row_num} for {record_id}")
-            else:
-                # Append new row
-                self.worksheet.append_row(row_data)
-                logger.info(f"✅ Appended new row for {record_id}")
+            # Delete duplicate rows (from bottom to top to avoid index shifting)
+            if rows_to_delete:
+                logger.info(f"🔄 Found {duplicates_found} duplicate records, removing...")
+                for row_num in sorted(set(rows_to_delete), reverse=True):
+                    self.worksheet.delete_rows(row_num)
+                    logger.info(f"   Deleted row {row_num}")
                 
-            return True
+                logger.info(f"✅ Removed {duplicates_found} duplicate records")
+                return duplicates_found
+            else:
+                logger.info("✅ No duplicates found")
+                return 0
             
         except Exception as e:
-            logger.error(f"❌ Failed to update {record_id}: {str(e)}")
-            return False
-
-    def get_all_records(self):
-        """Get all records from sheet (excluding header)"""
+            logger.error(f"❌ Error removing duplicates: {e}")
+            return 0
+    
+    def update_or_insert_records(self, records: List[Dict]) -> Tuple[int, int]:
+        """
+        Update existing records or insert new ones
+        Args: List of record dicts with keys: record_id, link, views, baseline, status
+        Returns: (updated_count, inserted_count)
+        """
         try:
-            all_records = self.worksheet.get_all_records()
-            logger.info(f"📊 Found {len(all_records)} records in Google Sheets")
-            return all_records
+            # Get current record index
+            record_index = self.get_all_records_with_index()
+            
+            updated_count = 0
+            inserted_count = 0
+            timestamp = datetime.now().isoformat()
+            
+            for record in records:
+                record_id = record.get('record_id', '')
+                
+                if not record_id:
+                    logger.warning("⚠️ Skipping record without record_id")
+                    continue
+                
+                # Prepare row data: [Record ID, Link, Current Views, 24h Baseline, Last Check, Status]
+                row_data = [
+                    record_id,
+                    record.get('link', ''),
+                    record.get('views', ''),
+                    record.get('baseline', ''),
+                    timestamp,
+                    record.get('status', 'success')
+                ]
+                
+                if record_id in record_index:
+                    # UPDATE existing record
+                    row_num = record_index[record_id]
+                    try:
+                        self.worksheet.update(f'A{row_num}:F{row_num}', [row_data])
+                        updated_count += 1
+                        logger.debug(f"✏️ Updated record {record_id} at row {row_num}")
+                    except Exception as e:
+                        logger.error(f"❌ Error updating row {row_num}: {e}")
+                else:
+                    # INSERT new record
+                    try:
+                        self.worksheet.append_row(row_data)
+                        inserted_count += 1
+                        logger.debug(f"✚ Inserted new record {record_id}")
+                    except Exception as e:
+                        logger.error(f"❌ Error inserting record {record_id}: {e}")
+            
+            logger.info(f"✅ Records updated: {updated_count}, inserted: {inserted_count}")
+            return updated_count, inserted_count
+            
         except Exception as e:
-            logger.error(f"Error getting records: {str(e)}")
-            return []
+            logger.error(f"❌ Error in update_or_insert_records: {e}")
+            return 0, 0
+    
+    def batch_update_records(self, records: List[Dict]) -> Tuple[int, int]:
+        """
+        Batch update/insert records efficiently
+        First removes duplicates, then updates/inserts
+        """
+        try:
+            logger.info("🔄 Starting batch update process...")
+            
+            # Step 1: Remove any existing duplicates first
+            duplicates_removed = self.remove_duplicates()
+            
+            # Step 2: Update or insert records
+            updated, inserted = self.update_or_insert_records(records)
+            
+            # Step 3: Final cleanup - remove any new duplicates that might have been created
+            final_duplicates = self.remove_duplicates()
+            
+            logger.info(f"✅ Batch update complete:")
+            logger.info(f"   • Duplicates removed (initial): {duplicates_removed}")
+            logger.info(f"   • Records updated: {updated}")
+            logger.info(f"   • Records inserted: {inserted}")
+            logger.info(f"   • Duplicates removed (final): {final_duplicates}")
+            
+            return updated, inserted
+            
+        except Exception as e:
+            logger.error(f"❌ Error in batch_update_records: {e}")
+            return 0, 0
