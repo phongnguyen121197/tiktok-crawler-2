@@ -1,9 +1,21 @@
+# FastAPI and server
 fastapi==0.104.1
 uvicorn==0.24.0
+
+# Environment and configuration
 python-dotenv==1.0.0
+
+# HTTP requests
 requests==2.31.0
+
+# Google Sheets integration
 gspread==5.12.0
 google-auth==2.25.2
 google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
-beautifulsoup4==4.12.2
+
+# Playwright for web scraping (NEW)
+playwright==1.40.0
+
+# Additional utilities
+python-multipart==0.0.6
