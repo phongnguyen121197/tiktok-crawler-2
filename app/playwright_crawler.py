@@ -28,13 +28,13 @@ class PlaywrightTikTokCrawler:
         """Context manager exit"""
         pass
     
-    def extract_publish_date(self, page) -> Optional[str]:
+    async def extract_publish_date(self, page) -> Optional[str]:
         """
         Extract publish date from TikTok video page
         Tries multiple methods to find the publish date
         
         Args:
-            page: Playwright page object (sync)
+            page: Playwright page object (async)
             
         Returns:
             str: ISO format date string (YYYY-MM-DD) or None if not found
@@ -52,7 +52,7 @@ class PlaywrightTikTokCrawler:
                 
                 for selector in meta_selectors:
                     try:
-                        publish_time = page.locator(selector).get_attribute('content', timeout=2000)
+                        publish_time = await page.locator(selector).get_attribute('content', timeout=2000)
                         if publish_time:
                             logger.info(f"📅 Found publish date in meta tag: {publish_time}")
                             dt = datetime.fromisoformat(publish_time.replace('Z', '+00:00'))
@@ -64,10 +64,10 @@ class PlaywrightTikTokCrawler:
             
             # ===== METHOD 2: Structured Data (JSON-LD) =====
             try:
-                script_elements = page.locator('script[type="application/ld+json"]').all()
+                script_elements = await page.locator('script[type="application/ld+json"]').all()
                 for script in script_elements:
                     try:
-                        content = script.inner_text()
+                        content = await script.inner_text()
                         data = json.loads(content)
                         
                         for date_field in ['uploadDate', 'datePublished', 'dateCreated']:
@@ -93,11 +93,11 @@ class PlaywrightTikTokCrawler:
                 
                 for selector in date_selectors:
                     try:
-                        date_elements = page.locator(selector).all()
+                        date_elements = await page.locator(selector).all()
                         for element in date_elements[:3]:
                             try:
-                                if element.is_visible(timeout=1000):
-                                    date_text = element.inner_text().strip()
+                                if await element.is_visible(timeout=1000):
+                                    date_text = (await element.inner_text()).strip()
                                     
                                     if not date_text or len(date_text) > 50:
                                         continue
@@ -175,7 +175,7 @@ class PlaywrightTikTokCrawler:
             
             # ===== METHOD 4: Page Source Regex =====
             try:
-                page_content = page.content()
+                page_content = await page.content()
                 
                 patterns = [
                     r'"uploadDate":"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})',
@@ -253,8 +253,8 @@ class PlaywrightTikTokCrawler:
                 # Extract stats
                 stats = await self._extract_stats(page)
                 
-                # 📅 NEW: Extract publish date
-                publish_date = await asyncio.to_thread(self.extract_publish_date, page)
+                # 📅 NEW: Extract publish date (now properly async)
+                publish_date = await self.extract_publish_date(page)
                 
                 # Add publish date to stats
                 if stats:
