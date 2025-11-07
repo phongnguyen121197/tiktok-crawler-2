@@ -3,6 +3,8 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 import re
 import random
 from typing import Optional, Dict
+from datetime import datetime, timedelta
+import json
 import logging
 
 logger = logging.getLogger(__name__)
@@ -11,6 +13,7 @@ class PlaywrightTikTokCrawler:
     """
     Simplified TikTok crawler with better stability
     Each video gets a fresh browser instance to avoid context issues
+    NOW WITH PUBLISH DATE EXTRACTION! 📅
     """
     
     def __init__(self):
@@ -25,10 +28,187 @@ class PlaywrightTikTokCrawler:
         """Context manager exit"""
         pass
     
+    def extract_publish_date(self, page) -> Optional[str]:
+        """
+        Extract publish date from TikTok video page
+        Tries multiple methods to find the publish date
+        
+        Args:
+            page: Playwright page object (sync)
+            
+        Returns:
+            str: ISO format date string (YYYY-MM-DD) or None if not found
+        """
+        try:
+            logger.info("📅 Attempting to extract publish date...")
+            
+            # ===== METHOD 1: Meta Tags =====
+            try:
+                meta_selectors = [
+                    'meta[property="video:release_date"]',
+                    'meta[property="article:published_time"]',
+                    'meta[name="uploadDate"]',
+                ]
+                
+                for selector in meta_selectors:
+                    try:
+                        publish_time = page.locator(selector).get_attribute('content', timeout=2000)
+                        if publish_time:
+                            logger.info(f"📅 Found publish date in meta tag: {publish_time}")
+                            dt = datetime.fromisoformat(publish_time.replace('Z', '+00:00'))
+                            return dt.strftime('%Y-%m-%d')
+                    except:
+                        pass
+            except Exception as e:
+                logger.debug(f"Meta tag method failed: {e}")
+            
+            # ===== METHOD 2: Structured Data (JSON-LD) =====
+            try:
+                script_elements = page.locator('script[type="application/ld+json"]').all()
+                for script in script_elements:
+                    try:
+                        content = script.inner_text()
+                        data = json.loads(content)
+                        
+                        for date_field in ['uploadDate', 'datePublished', 'dateCreated']:
+                            if date_field in data:
+                                date_str = data[date_field]
+                                logger.info(f"📅 Found publish date in JSON-LD: {date_str}")
+                                dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                                return dt.strftime('%Y-%m-%d')
+                    except:
+                        pass
+            except Exception as e:
+                logger.debug(f"JSON-LD method failed: {e}")
+            
+            # ===== METHOD 3: Visible Date Text =====
+            try:
+                date_selectors = [
+                    'span[data-e2e="browser-nickname"] + span',
+                    'span[class*="date"]',
+                    'span[class*="time"]',
+                    'div[class*="date"]',
+                    'time',
+                ]
+                
+                for selector in date_selectors:
+                    try:
+                        date_elements = page.locator(selector).all()
+                        for element in date_elements[:3]:
+                            try:
+                                if element.is_visible(timeout=1000):
+                                    date_text = element.inner_text().strip()
+                                    
+                                    if not date_text or len(date_text) > 50:
+                                        continue
+                                    
+                                    logger.debug(f"Found date text: {date_text}")
+                                    date_text_lower = date_text.lower()
+                                    
+                                    # Hours ago
+                                    if 'giờ' in date_text_lower or 'h ago' in date_text_lower or 'hour' in date_text_lower:
+                                        numbers = re.findall(r'\d+', date_text)
+                                        if numbers:
+                                            hours = int(numbers[0])
+                                            dt = datetime.now() - timedelta(hours=hours)
+                                            result = dt.strftime('%Y-%m-%d')
+                                            logger.info(f"📅 Parsed relative date (hours): {result}")
+                                            return result
+                                    
+                                    # Days ago
+                                    elif 'ngày' in date_text_lower or 'd ago' in date_text_lower or 'day' in date_text_lower:
+                                        numbers = re.findall(r'\d+', date_text)
+                                        if numbers:
+                                            days = int(numbers[0])
+                                            dt = datetime.now() - timedelta(days=days)
+                                            result = dt.strftime('%Y-%m-%d')
+                                            logger.info(f"📅 Parsed relative date (days): {result}")
+                                            return result
+                                    
+                                    # Weeks ago
+                                    elif 'tuần' in date_text_lower or 'w ago' in date_text_lower or 'week' in date_text_lower:
+                                        numbers = re.findall(r'\d+', date_text)
+                                        if numbers:
+                                            weeks = int(numbers[0])
+                                            dt = datetime.now() - timedelta(weeks=weeks)
+                                            result = dt.strftime('%Y-%m-%d')
+                                            logger.info(f"📅 Parsed relative date (weeks): {result}")
+                                            return result
+                                    
+                                    # Months ago
+                                    elif 'tháng' in date_text_lower or 'm ago' in date_text_lower or 'month' in date_text_lower:
+                                        numbers = re.findall(r'\d+', date_text)
+                                        if numbers:
+                                            months = int(numbers[0])
+                                            dt = datetime.now() - timedelta(days=months*30)
+                                            result = dt.strftime('%Y-%m-%d')
+                                            logger.info(f"📅 Parsed relative date (months): {result}")
+                                            return result
+                                    
+                                    # Absolute dates (1-15, 12-25)
+                                    elif re.match(r'^\d{1,2}-\d{1,2}$', date_text):
+                                        current_year = datetime.now().year
+                                        date_str = f"{current_year}-{date_text}"
+                                        try:
+                                            dt = datetime.strptime(date_str, '%Y-%m-%d')
+                                            result = dt.strftime('%Y-%m-%d')
+                                            logger.info(f"📅 Parsed absolute date: {result}")
+                                            return result
+                                        except:
+                                            continue
+                                    
+                                    # ISO dates (2025-10-15)
+                                    elif re.match(r'^\d{4}-\d{2}-\d{2}$', date_text):
+                                        try:
+                                            dt = datetime.strptime(date_text, '%Y-%m-%d')
+                                            result = dt.strftime('%Y-%m-%d')
+                                            logger.info(f"📅 Found ISO date: {result}")
+                                            return result
+                                        except:
+                                            continue
+                            except:
+                                continue
+                    except Exception as e:
+                        continue
+            except Exception as e:
+                logger.debug(f"Visible text method failed: {e}")
+            
+            # ===== METHOD 4: Page Source Regex =====
+            try:
+                page_content = page.content()
+                
+                patterns = [
+                    r'"uploadDate":"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})',
+                    r'"createTime":(\d{10})',
+                    r'"createTimeISO":"([^"]+)"',
+                ]
+                
+                for pattern in patterns:
+                    matches = re.findall(pattern, page_content)
+                    if matches:
+                        match = matches[0]
+                        logger.info(f"📅 Found date in page source: {match}")
+                        
+                        if match.isdigit() and len(match) == 10:
+                            dt = datetime.fromtimestamp(int(match))
+                            return dt.strftime('%Y-%m-%d')
+                        else:
+                            dt = datetime.fromisoformat(match.replace('Z', '+00:00'))
+                            return dt.strftime('%Y-%m-%d')
+            except Exception as e:
+                logger.debug(f"Page source method failed: {e}")
+            
+            logger.warning("⚠️ Could not extract publish date using any method")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Error extracting publish date: {e}")
+            return None
+    
     async def get_video_stats(self, video_url: str) -> Optional[Dict]:
         """
         Crawl single video with isolated browser instance per attempt
-        ✅ KEY FIX: Create fresh browser for each attempt to avoid context issues
+        ✅ NOW RETURNS PUBLISH DATE TOO! 📅
         """
         for attempt in range(self.max_retries):
             playwright = None
@@ -39,10 +219,8 @@ class PlaywrightTikTokCrawler:
             try:
                 logger.info(f"🔍 Crawling {video_url} (attempt {attempt + 1}/{self.max_retries})")
                 
-                # Random delay
                 await asyncio.sleep(random.uniform(1, 2))
                 
-                # ✅ FIX: Create fresh browser instance for each attempt
                 playwright = await async_playwright().start()
                 
                 browser = await playwright.chromium.launch(
@@ -60,7 +238,6 @@ class PlaywrightTikTokCrawler:
                     user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
                 )
                 
-                # Anti-detection
                 await context.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', {
                         get: () => undefined
@@ -69,14 +246,19 @@ class PlaywrightTikTokCrawler:
                 
                 page = await context.new_page()
                 
-                # Navigate
                 await page.goto(video_url, wait_until='domcontentloaded', timeout=self.timeout)
                 
-                # Wait for content
                 await asyncio.sleep(random.uniform(3, 5))
                 
                 # Extract stats
                 stats = await self._extract_stats(page)
+                
+                # 📅 NEW: Extract publish date
+                publish_date = await asyncio.to_thread(self.extract_publish_date, page)
+                
+                # Add publish date to stats
+                if stats:
+                    stats['publish_date'] = publish_date
                 
                 # Cleanup
                 await page.close()
@@ -84,9 +266,8 @@ class PlaywrightTikTokCrawler:
                 await browser.close()
                 await playwright.stop()
                 
-                # Check results
                 if stats and stats.get('views', 0) > 0:
-                    logger.info(f"✅ Success: {stats['views']:,} views")
+                    logger.info(f"✅ Success: {stats['views']:,} views, Published: {publish_date or 'N/A'}")
                     return stats
                 else:
                     logger.warning(f"⚠️ No stats found, attempt {attempt + 1}")
@@ -97,7 +278,6 @@ class PlaywrightTikTokCrawler:
                 logger.error(f"❌ Error: {e}")
                 
             finally:
-                # Ensure cleanup
                 try:
                     if page:
                         await page.close()
@@ -167,7 +347,6 @@ class PlaywrightTikTokCrawler:
                 except:
                     pass
             
-            # Parse and return
             if views:
                 parsed_views = self._parse_count(views)
                 if parsed_views > 0:
@@ -235,7 +414,7 @@ class TikTokPlaywrightCrawler:
         pass
     
     def get_tiktok_views(self, video_url: str) -> Optional[Dict]:
-        """Sync method to get video stats"""
+        """Sync method to get video stats (with publish date!)"""
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -285,7 +464,8 @@ async def test_crawler():
             stats = await crawler.get_video_stats(url)
             
             if stats:
-                print(f"✅ Success: {stats['views']:,} views\n")
+                print(f"✅ Success: {stats['views']:,} views")
+                print(f"📅 Published: {stats.get('publish_date', 'N/A')}\n")
             else:
                 print(f"❌ Failed\n")
 

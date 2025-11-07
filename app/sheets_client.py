@@ -11,6 +11,7 @@ class GoogleSheetsClient:
     """
     Google Sheets client with deduplication and rate limit handling
     Prevents duplicate records and handles API quota limits
+    NOW WITH PUBLISHED DATE COLUMN! 📅
     """
     
     def __init__(self, credentials_json: dict, sheet_id: str):
@@ -83,6 +84,7 @@ class GoogleSheetsClient:
     def batch_update_records(self, records: List[Dict]) -> tuple:
         """
         Update or insert records with deduplication and rate limit handling
+        NOW INCLUDES PUBLISHED DATE! 📅
         
         Args:
             records: List of record dicts with keys:
@@ -90,6 +92,7 @@ class GoogleSheetsClient:
                 - link: TikTok video URL
                 - views: Current view count
                 - baseline: 24h baseline views
+                - publish_date: Video publish date (YYYY-MM-DD)
                 - status: 'success' or 'partial'
         
         Returns:
@@ -157,20 +160,21 @@ class GoogleSheetsClient:
         for idx, (row_index, record) in enumerate(to_update, 1):
             try:
                 # Prepare row data
-                # Columns: Record ID | Link TikTok | Current Views | 24h Baseline | Last Check | Status
+                # Columns: Record ID | Link TikTok | Current Views | 24h Baseline | Published Date | Last Check | Status
                 row_data = [
                     [
                         record['record_id'],
                         record['link'],
                         record['views'],
                         record['baseline'],
+                        record.get('publish_date', ''),  # 📅 NEW COLUMN
                         timestamp,
                         record['status']
                     ]
                 ]
                 
                 # Update the row
-                range_name = f'A{row_index}:F{row_index}'
+                range_name = f'A{row_index}:G{row_index}'  # Extended to column G
                 self.worksheet.update(range_name, row_data, value_input_option='USER_ENTERED')
                 
                 updated_count += 1
@@ -199,11 +203,12 @@ class GoogleSheetsClient:
                                 record['link'],
                                 record['views'],
                                 record['baseline'],
+                                record.get('publish_date', ''),
                                 timestamp,
                                 record['status']
                             ]
                         ]
-                        range_name = f'A{row_index}:F{row_index}'
+                        range_name = f'A{row_index}:G{row_index}'
                         self.worksheet.update(range_name, row_data, value_input_option='USER_ENTERED')
                         updated_count += 1
                         logger.info(f"  ✅ Retry successful for row {row_index}")
@@ -234,11 +239,13 @@ class GoogleSheetsClient:
         for idx, record in enumerate(to_insert, 1):
             try:
                 # Prepare row data
+                # Columns: Record ID | Link TikTok | Current Views | 24h Baseline | Published Date | Last Check | Status
                 row_data = [
                     record['record_id'],
                     record['link'],
                     record['views'],
                     record['baseline'],
+                    record.get('publish_date', ''),  # 📅 NEW COLUMN
                     timestamp,
                     record['status']
                 ]
@@ -270,6 +277,7 @@ class GoogleSheetsClient:
                             record['link'],
                             record['views'],
                             record['baseline'],
+                            record.get('publish_date', ''),
                             timestamp,
                             record['status']
                         ]

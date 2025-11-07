@@ -1,0 +1,514 @@
+import asyncio
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+import re
+import random
+from typing import Optional, Dict
+import logging
+
+logger = logging.getLogger(__name__)
+
+class PlaywrightTikTokCrawler:
+    """
+    Enhanced TikTok crawler using Playwright for direct scraping
+    Optimized for Railway deployment with better anti-detection
+    """
+    
+    def __init__(self):
+        self.browser = None
+        self.context = None
+        self.playwright = None
+        self.max_retries = 3
+        self.timeout = 25000  # 25 seconds per video (increased from 20s)
+        
+    async def __aenter__(self):
+        """Context manager entry - initialize browser"""
+        await self.init_browser()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - cleanup browser"""
+        await self.close_browser()
+    
+    async def init_browser(self):
+        """Initialize Playwright browser with enhanced anti-detection settings"""
+        try:
+            self.playwright = await async_playwright().start()
+            
+            # ✅ IMPROVED: Enhanced browser args for better stealth
+            self.browser = await self.playwright.chromium.launch(
+                headless=True,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--disable-software-rasterizer',
+                    '--disable-setuid-sandbox',
+                    '--disable-web-security',  # Added
+                    '--disable-features=IsolateOrigins,site-per-process',  # Added
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--single-process',  # Added for Railway
+                ]
+            )
+            
+            # ✅ IMPROVED: More realistic browser context
+            self.context = await self.browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                locale='en-US',
+                timezone_id='Asia/Ho_Chi_Minh',
+                java_script_enabled=True,
+                bypass_csp=True,  # Added
+                ignore_https_errors=True,  # Added
+            )
+            
+            # ✅ IMPROVED: Enhanced anti-detection script
+            await self.context.add_init_script("""
+                // Remove webdriver flag
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+                
+                // Override plugins
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+                
+                // Override languages
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en']
+                });
+                
+                // Override chrome object
+                window.chrome = {
+                    runtime: {}
+                };
+                
+                // Override permissions
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
+            """)
+            
+            logger.info("✅ Browser initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize browser: {e}")
+            raise
+    
+    async def close_browser(self):
+        """Cleanup browser resources"""
+        try:
+            if self.context:
+                await self.context.close()
+            if self.browser:
+                await self.browser.close()
+            if self.playwright:
+                await self.playwright.stop()
+            logger.info("✅ Browser closed successfully")
+        except Exception as e:
+            logger.error(f"⚠️ Error closing browser: {e}")
+    
+    async def get_video_stats(self, video_url: str) -> Optional[Dict]:
+        """
+        Crawl a single TikTok video and extract stats
+        
+        Args:
+            video_url: TikTok video URL
+            
+        Returns:
+            Dict with views, likes, comments, shares or None if failed
+        """
+        for attempt in range(self.max_retries):
+            page = None
+            try:
+                page = await self.context.new_page()
+                
+                logger.info(f"🔍 Crawling {video_url} (attempt {attempt + 1}/{self.max_retries})")
+                
+                # ✅ IMPROVED: Random delay before navigation
+                await asyncio.sleep(random.uniform(1.5, 3.0))
+                
+                # Navigate to video
+                await page.goto(video_url, wait_until='domcontentloaded', timeout=self.timeout)
+                
+                # ✅ IMPROVED: Random wait for dynamic content
+                await asyncio.sleep(random.uniform(3, 5))
+                
+                # Extract stats using multiple strategies
+                stats = await self._extract_stats_from_page(page)
+                
+                await page.close()
+                
+                if stats and stats.get('views', 0) > 0:
+                    logger.info(f"✅ Successfully crawled {video_url}: {stats['views']:,} views")
+                    return stats
+                else:
+                    logger.warning(f"⚠️ No stats found for {video_url}, attempt {attempt + 1}")
+                    # Random delay before retry
+                    if attempt < self.max_retries - 1:
+                        await asyncio.sleep(random.uniform(2, 4))
+                    
+            except PlaywrightTimeout:
+                logger.warning(f"⏱️ Timeout for {video_url}, attempt {attempt + 1}/{self.max_retries}")
+                if page:
+                    await page.close()
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(random.uniform(3, 5))
+                
+            except Exception as e:
+                logger.error(f"❌ Error crawling {video_url}: {e}, attempt {attempt + 1}")
+                if page:
+                    await page.close()
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(random.uniform(3, 5))
+        
+        logger.error(f"❌ Failed to crawl {video_url} after {self.max_retries} attempts")
+        return None
+    
+    async def _extract_stats_from_page(self, page) -> Optional[Dict]:
+        """
+        Extract view count and engagement stats from TikTok page
+        Uses multiple extraction strategies with comprehensive fallbacks
+        """
+        try:
+            # Wait for video container (with fallback)
+            try:
+                await page.wait_for_selector('[data-e2e="browse-video"]', timeout=10000)
+            except:
+                logger.warning("Video container not found, trying alternative selectors")
+            
+            # ✅ STRATEGY 1: Try data-e2e attributes (most reliable)
+            views = await self._try_selector(page, '[data-e2e="video-views"]')
+            likes = await self._try_selector(page, '[data-e2e="like-count"]')
+            comments = await self._try_selector(page, '[data-e2e="comment-count"]')
+            shares = await self._try_selector(page, '[data-e2e="share-count"]')
+            
+            # ✅ STRATEGY 2: Try alternative data-e2e selectors
+            if not views:
+                views = await self._try_selector(page, 'strong[data-e2e="video-views"]')
+            
+            if not views:
+                views = await self._try_selector(page, '[data-e2e="browse-video-desc"] strong')
+            
+            if not views:
+                views = await self._try_selector(page, 'strong[data-e2e="browse-video-views"]')
+            
+            # ✅ STRATEGY 3: Try generic strong tags near video info
+            if not views:
+                views = await self._try_multiple_selectors(page, [
+                    'div[class*="video-info"] strong:first-child',
+                    'div[class*="VideoInfo"] strong:first-child',
+                    'div[class*="video-meta"] strong:first-child',
+                    'div[class*="VideoMeta"] strong:first-child',
+                ])
+            
+            # ✅ STRATEGY 4: Extract from page HTML using regex (MOST RELIABLE based on logs)
+            if not views:
+                content = await page.content()
+                views = self._extract_views_from_html(content)
+                if views:
+                    logger.info(f"Found views via regex pattern: \"{views}\"")
+            
+            # ✅ STRATEGY 5: Try JSON-LD structured data
+            if not views:
+                views = await self._extract_from_json_ld(page)
+            
+            # ✅ STRATEGY 6: Extract from __UNIVERSAL_DATA_FOR_REHYDRATION__
+            if not views:
+                views = await self._extract_from_universal_data(page)
+            
+            # Parse and validate views
+            if views:
+                parsed_views = self._parse_count(views)
+                if parsed_views > 0:
+                    return {
+                        'views': parsed_views,
+                        'likes': self._parse_count(likes) if likes else 0,
+                        'comments': self._parse_count(comments) if comments else 0,
+                        'shares': self._parse_count(shares) if shares else 0,
+                    }
+            
+            logger.warning("Could not extract views from any strategy")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting stats: {e}")
+            return None
+    
+    async def _try_selector(self, page, selector: str) -> Optional[str]:
+        """Try to get text from a selector, return None if not found"""
+        try:
+            element = await page.query_selector(selector)
+            if element:
+                text = await element.inner_text()
+                return text.strip() if text else None
+        except Exception as e:
+            logger.debug(f"Selector {selector} failed: {e}")
+        return None
+    
+    async def _try_multiple_selectors(self, page, selectors: list) -> Optional[str]:
+        """Try multiple selectors, return first successful result"""
+        for selector in selectors:
+            result = await self._try_selector(page, selector)
+            if result:
+                return result
+        return None
+    
+    async def _extract_from_json_ld(self, page) -> Optional[str]:
+        """Extract view count from JSON-LD structured data"""
+        try:
+            json_ld = await page.query_selector('script[type="application/ld+json"]')
+            if json_ld:
+                content = await json_ld.inner_text()
+                import json
+                data = json.loads(content)
+                
+                # Try different possible paths in JSON-LD
+                if 'interactionStatistic' in data:
+                    for stat in data['interactionStatistic']:
+                        if stat.get('@type') == 'InteractionCounter':
+                            if 'WatchAction' in stat.get('interactionType', ''):
+                                return str(stat.get('userInteractionCount'))
+        except Exception as e:
+            logger.debug(f"JSON-LD extraction failed: {e}")
+        return None
+    
+    async def _extract_from_universal_data(self, page) -> Optional[str]:
+        """Extract from __UNIVERSAL_DATA_FOR_REHYDRATION__ or SIGI_STATE"""
+        try:
+            scripts = await page.query_selector_all('script')
+            for script in scripts:
+                content = await script.inner_text()
+                if '__UNIVERSAL_DATA_FOR_REHYDRATION__' in content or 'SIGI_STATE' in content:
+                    # Try to extract playCount
+                    match = re.search(r'"playCount"["\s:]+(\d+)', content)
+                    if match:
+                        logger.info("Found views via universal data")
+                        return match.group(1)
+        except Exception as e:
+            logger.debug(f"Universal data extraction failed: {e}")
+        return None
+    
+    def _extract_views_from_html(self, html: str) -> Optional[str]:
+        """
+        ✅ IMPROVED: Extract view count from HTML using comprehensive regex patterns
+        Based on analysis of actual TikTok pages
+        """
+        patterns = [
+            # Most common patterns (from logs)
+            r'"playCount":(\d+)',  # This works in many cases
+            r'"playCount":\s*(\d+)',
+            r'playCount&quot;:(\d+)',
+            
+            # Alternative field names
+            r'"viewCount":(\d+)',
+            r'"view_count":(\d+)',
+            r'viewCount&quot;:(\d+)',
+            
+            # Nested in videoData or itemInfo
+            r'"videoData"[^}]*"playCount":(\d+)',
+            r'"itemInfo"[^}]*"playCount":(\d+)',
+            r'"stats"[^}]*"playCount":(\d+)',
+            
+            # Meta tags
+            r'video:views.*?content="(\d+)"',
+            r'name="video:views".*?content="(\d+)"',
+            
+            # JavaScript variables
+            r'playCount\s*[:=]\s*(\d+)',
+            r'views\s*[:=]\s*(\d+)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, html)
+            if match:
+                logger.info(f'Found views via regex pattern: {pattern}')
+                return match.group(1)
+        
+        return None
+    
+    def _parse_count(self, count_str: str) -> int:
+        """
+        Parse TikTok count string to integer
+        Examples: '1.2M' -> 1200000, '52.3K' -> 52300, '1234' -> 1234
+        """
+        if not count_str:
+            return 0
+        
+        count_str = str(count_str).strip().upper()
+        
+        try:
+            # Remove any non-numeric chars except K, M, B, .
+            count_str = re.sub(r'[^\d.KMB]', '', count_str)
+            
+            if not count_str:
+                return 0
+            
+            multipliers = {'K': 1000, 'M': 1000000, 'B': 1000000000}
+            
+            for suffix, multiplier in multipliers.items():
+                if suffix in count_str:
+                    number = float(count_str.replace(suffix, ''))
+                    return int(number * multiplier)
+            
+            return int(float(count_str))
+        except Exception as e:
+            logger.debug(f"Failed to parse count '{count_str}': {e}")
+            return 0
+    
+    async def crawl_batch(self, video_urls: list) -> Dict[str, Optional[Dict]]:
+        """
+        Crawl multiple videos sequentially with random delays
+        
+        Args:
+            video_urls: List of TikTok video URLs
+            
+        Returns:
+            Dict mapping URL to stats dict
+        """
+        results = {}
+        total = len(video_urls)
+        
+        for i, url in enumerate(video_urls):
+            logger.info(f"📊 Progress: {i+1}/{total} ({(i+1)/total*100:.1f}%)")
+            
+            stats = await self.get_video_stats(url)
+            results[url] = stats
+            
+            # ✅ IMPROVED: Random delay between requests to avoid rate limiting
+            if i < total - 1:
+                delay = random.uniform(2, 4)  # 2-4 seconds random delay
+                await asyncio.sleep(delay)
+        
+        # Summary
+        success_count = sum(1 for v in results.values() if v is not None)
+        success_rate = (success_count/total*100) if total > 0 else 0
+        logger.info(f"🎯 Batch complete: {success_count}/{total} successful ({success_rate:.1f}%)")
+        
+        return results
+
+
+# ✅ IMPROVED: Better sync wrapper for FastAPI compatibility
+class TikTokPlaywrightCrawler:
+    """
+    Synchronous wrapper for async Playwright crawler
+    Fixed event loop handling for FastAPI compatibility
+    """
+    
+    def __init__(self):
+        self.async_crawler = None
+    
+    def get_tiktok_views(self, video_url: str) -> Optional[Dict]:
+        """
+        Synchronous method to get video stats
+        Compatible with existing crawler.py interface
+        
+        Returns same format as old API: {views, likes, comments, shares}
+        """
+        try:
+            # ✅ FIX: Better event loop handling for FastAPI
+            try:
+                # Try to get existing event loop
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If loop is running (FastAPI), use run_in_executor
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(self._run_in_new_loop, video_url)
+                        return future.result()
+                else:
+                    # If loop is not running, use it
+                    return loop.run_until_complete(self._async_get_stats(video_url))
+            except RuntimeError:
+                # No event loop, create new one
+                return self._run_in_new_loop(video_url)
+            
+        except Exception as e:
+            logger.error(f"❌ Sync wrapper error for {video_url}: {e}")
+            return None
+    
+    def _run_in_new_loop(self, video_url: str) -> Optional[Dict]:
+        """Run in a new event loop (for thread safety)"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(self._async_get_stats(video_url))
+        finally:
+            loop.close()
+    
+    async def _async_get_stats(self, video_url: str) -> Optional[Dict]:
+        """Async helper for getting stats"""
+        async with PlaywrightTikTokCrawler() as crawler:
+            return await crawler.get_video_stats(video_url)
+    
+    def crawl_batch_sync(self, video_urls: list) -> Dict[str, Optional[Dict]]:
+        """
+        ✅ IMPROVED: Synchronous batch crawl with better event loop handling
+        More efficient than calling get_tiktok_views multiple times
+        """
+        try:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(self._run_batch_in_new_loop, video_urls)
+                        return future.result()
+                else:
+                    return loop.run_until_complete(self._async_batch_crawl(video_urls))
+            except RuntimeError:
+                return self._run_batch_in_new_loop(video_urls)
+            
+        except Exception as e:
+            logger.error(f"❌ Batch sync wrapper error: {e}")
+            return {}
+    
+    def _run_batch_in_new_loop(self, video_urls: list) -> Dict[str, Optional[Dict]]:
+        """Run batch in a new event loop"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(self._async_batch_crawl(video_urls))
+        finally:
+            loop.close()
+    
+    async def _async_batch_crawl(self, video_urls: list) -> Dict[str, Optional[Dict]]:
+        """Async helper for batch crawling"""
+        async with PlaywrightTikTokCrawler() as crawler:
+            return await crawler.crawl_batch(video_urls)
+
+
+# Test function
+async def test_crawler():
+    """Test the crawler with a sample video"""
+    test_urls = [
+        "https://vt.tiktok.com/ZSUPWkfRN/",  # Short URL
+        "https://www.tiktok.com/@thanhtg98/video/7559145944147610888",  # Full URL
+    ]
+    
+    async with PlaywrightTikTokCrawler() as crawler:
+        print(f"\n🧪 Testing crawler with {len(test_urls)} videos\n")
+        
+        for url in test_urls:
+            print(f"Testing: {url}")
+            stats = await crawler.get_video_stats(url)
+            
+            if stats:
+                print(f"✅ Success!")
+                print(f"   Views: {stats['views']:,}")
+                print(f"   Likes: {stats['likes']:,}")
+                print(f"   Comments: {stats['comments']:,}")
+                print(f"   Shares: {stats['shares']:,}\n")
+            else:
+                print(f"❌ Failed to crawl video\n")
+
+
+if __name__ == "__main__":
+    # Run test
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(test_crawler())

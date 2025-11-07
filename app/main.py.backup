@@ -3,14 +3,14 @@ import os
 load_dotenv()
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 from app.crawler import TikTokCrawler
 from app.lark_client import LarkClient
 from app.sheets_client import GoogleSheetsClient
+import asyncio
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -59,12 +59,11 @@ def init_clients():
         sheets_client = None
     
     try:
-        # Initialize TikTok crawler with Playwright support
+        # Initialize TikTok crawler
         if lark_client and sheets_client:
             crawler = TikTokCrawler(
                 lark_client=lark_client,
-                sheets_client=sheets_client,
-                use_playwright=True  # Enable Playwright by default
+                sheets_client=sheets_client
             )
             logger.info("✅ TikTok crawler initialized successfully")
         else:
@@ -85,35 +84,23 @@ async def startup_event():
 async def root():
     return {
         "message": "TikTok View Crawler API", 
-        "version": "2.3.0",
-        "mode": "Playwright + Google Sheets + Lark Bitable + Deduplication",
-        "features": [
-            "Direct TikTok scraping via Playwright",
-            "Automatic fallback to Lark data",
-            "Duplicate prevention",
-            "Background job processing"
-        ]
+        "version": "2.1.0",
+        "mode": "Google Sheets + Lark Bitable + Deduplication"
     }
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {
         "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
         "lark_connected": lark_client is not None,
         "sheets_connected": sheets_client is not None,
-        "crawler_ready": crawler is not None,
-        "playwright_enabled": crawler.use_playwright if crawler else False
+        "crawler_ready": crawler is not None
     }
 
 @app.get("/test")
 async def test():
-    """Simple test endpoint"""
-    return {
-        "message": "Test endpoint works", 
-        "timestamp": datetime.now().isoformat()
-    }
+    return {"message": "Test endpoint works", "timestamp": datetime.now().isoformat()}
 
 @app.get("/test/lark")
 async def test_lark_connection():
@@ -155,10 +142,7 @@ async def test_sheets_connection():
 
 @app.post("/jobs/daily")
 async def daily_crawl_job(background_tasks: BackgroundTasks):
-    """
-    Trigger daily crawler job - runs in background
-    Expected duration: 30-40 minutes for 227 records with Playwright
-    """
+    """Trigger daily crawler job - runs in background"""
     
     if not lark_client:
         raise HTTPException(status_code=500, detail="Lark client not initialized")
@@ -167,7 +151,7 @@ async def daily_crawl_job(background_tasks: BackgroundTasks):
     if not crawler:
         raise HTTPException(status_code=500, detail="Crawler not initialized")
     
-    # ✅ FIXED: Use sync function for background task (not async)
+    # Start background task
     background_tasks.add_task(run_daily_crawl)
     
     logger.info("🚀 Daily crawl job started in background")
@@ -175,41 +159,22 @@ async def daily_crawl_job(background_tasks: BackgroundTasks):
         "success": True,
         "status": "started",
         "message": "Daily crawler job started in background",
-        "note": "Playwright crawling takes 30-40 minutes for 227 records",
-        "estimated_completion": "Check Google Sheets in 40-45 minutes",
+        "note": "Check Google Sheets in 5-10 minutes for results",
         "timestamp": datetime.now().isoformat()
     }
 
-def run_daily_crawl():
-    """
-    Main crawler logic - runs in background
-    ✅ FIXED: Changed from async to sync function
-    """
+async def run_daily_crawl():
+    """Main crawler logic - runs in background"""
     try:
         logger.info("🚀 Starting daily crawl (background job)")
-        logger.info("⏱️ Expected duration: 30-40 minutes with Playwright")
         
-        # Run crawler (this is a sync function)
+        # Run crawler
         result = crawler.crawl_all_videos()
         
         logger.info(f"✅ Daily crawl completed: {result}")
         
-        # Log success rate
-        if result.get('success') and result.get('stats'):
-            stats = result['stats']
-            total = stats.get('total', 0)
-            processed = stats.get('processed', 0)
-            failed = stats.get('failed', 0)
-            
-            if total > 0:
-                success_rate = (processed / total) * 100
-                logger.info(f"📊 Success rate: {success_rate:.1f}% ({processed}/{total})")
-                
-                if success_rate < 80:
-                    logger.warning(f"⚠️ Low success rate: {success_rate:.1f}%")
-        
     except Exception as e:
-        logger.error(f"❌ Daily crawl failed: {e}", exc_info=True)
+        logger.error(f"❌ Daily crawl failed: {e}")
 
 @app.get("/status")
 async def get_status():
@@ -218,25 +183,19 @@ async def get_status():
         lark_ok = lark_client is not None
         sheets_ok = sheets_client is not None
         crawler_ok = crawler is not None
-        playwright_ok = crawler.use_playwright if crawler else False
         
         return {
             "status": "ok" if all([lark_ok, sheets_ok, crawler_ok]) else "degraded",
             "services": {
-                "lark": "healthy" if lark_ok else "not_initialized",
-                "sheets": "healthy" if sheets_ok else "not_initialized",
-                "crawler": "healthy" if crawler_ok else "not_initialized",
-                "playwright": "enabled" if playwright_ok else "disabled"
+                "lark": "✅ ready" if lark_ok else "❌ not initialized",
+                "sheets": "✅ ready" if sheets_ok else "❌ not initialized",
+                "crawler": "✅ ready" if crawler_ok else "❌ not initialized"
             },
             "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
         logger.error(f"Error getting status: {e}")
-        # ✅ FIXED: Proper error response format
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)}
-        )
+        return {"status": "error", "message": str(e)}, 500
 
 class CrawlRequest(BaseModel):
     """Manual crawl request model"""
@@ -244,78 +203,35 @@ class CrawlRequest(BaseModel):
 
 @app.post("/jobs/crawl-batch")
 async def crawl_batch(request: CrawlRequest, background_tasks: BackgroundTasks):
-    """
-    Crawl specific records by IDs
-    Useful for re-crawling failed videos or testing
-    """
+    """Crawl specific records by IDs"""
     
     if not crawler:
         raise HTTPException(status_code=500, detail="Crawler not initialized")
     
-    # ✅ FIXED: Changed to sync function (not async)
-    def batch_task():
+    async def batch_task():
         try:
-            logger.info(f"📋 Starting batch crawl for {len(request.record_ids) if request.record_ids else 'all'} records")
             result = crawler.crawl_videos_batch(record_ids=request.record_ids)
             logger.info(f"✅ Batch crawl completed: {result}")
         except Exception as e:
-            logger.error(f"❌ Batch crawl failed: {e}", exc_info=True)
+            logger.error(f"❌ Batch crawl failed: {e}")
     
     background_tasks.add_task(batch_task)
     
-    record_count = len(request.record_ids) if request.record_ids else "all"
-    logger.info(f"📋 Batch crawl job started for {record_count} records")
-    
+    logger.info(f"📋 Batch crawl job started for {len(request.record_ids) if request.record_ids else 'all'} records")
     return {
         "success": True,
         "message": "Batch crawl job started",
-        "record_count": record_count,
+        "record_count": len(request.record_ids) if request.record_ids else "all",
         "timestamp": datetime.now().isoformat()
     }
 
-# ✅ IMPROVED: Better global exception handler
+# Error handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     """Global exception handler"""
-    logger.error(f"❌ Unhandled exception: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "success": False,
-            "message": "Internal server error",
-            "error": str(exc),
-            "timestamp": datetime.now().isoformat()
-        }
-    )
-
-# Additional helper endpoint for debugging
-@app.get("/debug/info")
-async def debug_info():
-    """
-    Debug information endpoint
-    Shows current configuration and status
-    """
+    logger.error(f"❌ Unhandled exception: {exc}")
     return {
-        "environment": {
-            "lark_configured": bool(os.getenv("LARK_APP_ID")),
-            "sheets_configured": bool(os.getenv("GOOGLE_SHEET_ID")),
-            "railway_env": bool(os.getenv("RAILWAY_ENVIRONMENT"))
-        },
-        "clients": {
-            "lark_initialized": lark_client is not None,
-            "sheets_initialized": sheets_client is not None,
-            "crawler_initialized": crawler is not None,
-            "playwright_available": crawler.use_playwright if crawler else False
-        },
-        "version": "2.3.0",
-        "timestamp": datetime.now().isoformat()
+        "success": False,
+        "message": "Internal server error",
+        "error": str(exc)
     }
-
-# ✅ OPTIONAL: Support for direct run (useful for local testing)
-# This is NOT used in Railway (Railway uses Dockerfile CMD instead)
-# But it's useful if you want to run: python -m app.main
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    logger.info(f"🚀 Starting server on port {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
