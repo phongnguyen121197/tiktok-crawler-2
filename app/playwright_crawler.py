@@ -62,7 +62,71 @@ class PlaywrightTikTokCrawler:
             except Exception as e:
                 logger.debug(f"Meta tag method failed: {e}")
             
-            # ===== METHOD 2: Structured Data (JSON-LD) =====
+            # ===== METHOD 2: TikTok's Embedded Data (HIGH PRIORITY) =====
+            # TikTok embeds video data in __UNIVERSAL_DATA_FOR_REHYDRATION__
+            try:
+                page_content = await page.content()
+                
+                # Look for TikTok's data structure
+                universal_data_pattern = r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>'
+                match = re.search(universal_data_pattern, page_content, re.DOTALL)
+                
+                if match:
+                    try:
+                        data_str = match.group(1)
+                        data = json.loads(data_str)
+                        
+                        # Navigate to video detail
+                        # Path: __DEFAULT_SCOPE__['webapp.video-detail']['itemInfo']['itemStruct']['createTime']
+                        if '__DEFAULT_SCOPE__' in data:
+                            scope = data['__DEFAULT_SCOPE__']
+                            
+                            # Check video-detail path
+                            if 'webapp.video-detail' in scope:
+                                video_detail = scope['webapp.video-detail']
+                                
+                                # Try itemInfo path
+                                if 'itemInfo' in video_detail and 'itemStruct' in video_detail['itemInfo']:
+                                    item = video_detail['itemInfo']['itemStruct']
+                                    if 'createTime' in item:
+                                        timestamp = int(item['createTime'])
+                                        logger.info(f"📅 Found video createTime in UNIVERSAL_DATA: {timestamp}")
+                                        dt = datetime.fromtimestamp(timestamp)
+                                        return dt.strftime('%Y-%m-%d')
+                                
+                                # Try direct item path
+                                if 'item' in video_detail and 'createTime' in video_detail['item']:
+                                    timestamp = int(video_detail['item']['createTime'])
+                                    logger.info(f"📅 Found video createTime in item: {timestamp}")
+                                    dt = datetime.fromtimestamp(timestamp)
+                                    return dt.strftime('%Y-%m-%d')
+                    except (json.JSONDecodeError, KeyError, ValueError) as e:
+                        logger.debug(f"Failed to parse UNIVERSAL_DATA: {e}")
+                
+                # Alternative: Look for SIGI_STATE
+                sigi_pattern = r'<script id="SIGI_STATE"[^>]*>(.*?)</script>'
+                match = re.search(sigi_pattern, page_content, re.DOTALL)
+                
+                if match:
+                    try:
+                        data_str = match.group(1)
+                        data = json.loads(data_str)
+                        
+                        # Look for ItemModule with video data
+                        if 'ItemModule' in data:
+                            for video_id, video_data in data['ItemModule'].items():
+                                if 'createTime' in video_data:
+                                    timestamp = int(video_data['createTime'])
+                                    logger.info(f"📅 Found video createTime in SIGI_STATE: {timestamp}")
+                                    dt = datetime.fromtimestamp(timestamp)
+                                    return dt.strftime('%Y-%m-%d')
+                    except (json.JSONDecodeError, KeyError, ValueError) as e:
+                        logger.debug(f"Failed to parse SIGI_STATE: {e}")
+                        
+            except Exception as e:
+                logger.debug(f"TikTok embedded data method failed: {e}")
+            
+            # ===== METHOD 3: Structured Data (JSON-LD) =====
             try:
                 script_elements = await page.locator('script[type="application/ld+json"]').all()
                 for script in script_elements:
@@ -81,7 +145,7 @@ class PlaywrightTikTokCrawler:
             except Exception as e:
                 logger.debug(f"JSON-LD method failed: {e}")
             
-            # ===== METHOD 3: Visible Date Text =====
+            # ===== METHOD 4: Visible Date Text =====
             try:
                 date_selectors = [
                     'span[data-e2e="browser-nickname"] + span',
@@ -173,13 +237,48 @@ class PlaywrightTikTokCrawler:
             except Exception as e:
                 logger.debug(f"Visible text method failed: {e}")
             
-            # ===== METHOD 4: Page Source Regex =====
+            # ===== METHOD 5: Page Source Regex (IMPROVED - Target video, not account) =====
             try:
                 page_content = await page.content()
                 
+                # CRITICAL: Look for createTime in VIDEO detail context, not user/author context
+                # TikTok has multiple createTime: user account + video
+                # We need VIDEO createTime specifically
+                
+                # Pattern 1: Look for video detail object with createTime
+                # This is more specific and targets the video data structure
+                video_detail_pattern = r'"video"[^}]*?"createTime"["\s:]*(\d{10})'
+                matches = re.findall(video_detail_pattern, page_content, re.IGNORECASE)
+                if matches:
+                    # Get the LAST match (more likely to be video, not account)
+                    match = matches[-1]
+                    logger.info(f"📅 Found video createTime in detail object: {match}")
+                    dt = datetime.fromtimestamp(int(match))
+                    return dt.strftime('%Y-%m-%d')
+                
+                # Pattern 2: Look for itemInfo or itemStruct with createTime
+                item_pattern = r'"(?:itemInfo|itemStruct|itemModule)"[^}]*?"createTime"["\s:]*(\d{10})'
+                matches = re.findall(item_pattern, page_content, re.IGNORECASE)
+                if matches:
+                    match = matches[0]  # First match in itemInfo is usually the video
+                    logger.info(f"📅 Found video createTime in itemInfo: {match}")
+                    dt = datetime.fromtimestamp(int(match))
+                    return dt.strftime('%Y-%m-%d')
+                
+                # Pattern 3: Look for "createTime" NOT in "author" or "user" context
+                # This excludes account creation time
+                non_author_pattern = r'(?<!"author"[^}]{0,500})"createTime"["\s:]*(\d{10})(?![^}]*?"nickname")'
+                matches = re.findall(non_author_pattern, page_content)
+                if matches:
+                    # Use LAST match as it's more likely to be video data
+                    match = matches[-1]
+                    logger.info(f"📅 Found createTime (non-author context): {match}")
+                    dt = datetime.fromtimestamp(int(match))
+                    return dt.strftime('%Y-%m-%d')
+                
+                # Pattern 4: Fallback - ISO format dates
                 patterns = [
                     r'"uploadDate":"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})',
-                    r'"createTime":(\d{10})',
                     r'"createTimeISO":"([^"]+)"',
                 ]
                 
@@ -187,14 +286,10 @@ class PlaywrightTikTokCrawler:
                     matches = re.findall(pattern, page_content)
                     if matches:
                         match = matches[0]
-                        logger.info(f"📅 Found date in page source: {match}")
+                        logger.info(f"📅 Found date in ISO format: {match}")
+                        dt = datetime.fromisoformat(match.replace('Z', '+00:00'))
+                        return dt.strftime('%Y-%m-%d')
                         
-                        if match.isdigit() and len(match) == 10:
-                            dt = datetime.fromtimestamp(int(match))
-                            return dt.strftime('%Y-%m-%d')
-                        else:
-                            dt = datetime.fromisoformat(match.replace('Z', '+00:00'))
-                            return dt.strftime('%Y-%m-%d')
             except Exception as e:
                 logger.debug(f"Page source method failed: {e}")
             
