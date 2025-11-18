@@ -19,6 +19,34 @@ class PlaywrightTikTokCrawler:
     def __init__(self):
         self.max_retries = 3
         self.timeout = 30000  # 30 seconds
+    
+    def _convert_timestamp_to_date(self, timestamp: int) -> str:
+        """
+        Convert timestamp to YYYY-MM-DD format
+        Handles both seconds (10 digits) and milliseconds (13 digits)
+        
+        Args:
+            timestamp: Unix timestamp in seconds or milliseconds
+            
+        Returns:
+            str: Date in YYYY-MM-DD format
+        """
+        try:
+            # Convert to int if string
+            if isinstance(timestamp, str):
+                timestamp = int(timestamp)
+            
+            # Check if milliseconds (13 digits) and convert to seconds
+            if len(str(timestamp)) == 13:
+                timestamp = timestamp / 1000
+                logger.debug(f"Converted milliseconds {timestamp*1000} to seconds {timestamp}")
+            
+            # Convert to date
+            dt = datetime.fromtimestamp(timestamp)
+            return dt.strftime('%Y-%m-%d')
+        except Exception as e:
+            logger.error(f"Error converting timestamp {timestamp}: {e}")
+            return None
         
     async def __aenter__(self):
         """Context manager entry"""
@@ -91,15 +119,17 @@ class PlaywrightTikTokCrawler:
                                     if 'createTime' in item:
                                         timestamp = int(item['createTime'])
                                         logger.info(f"📅 Found video createTime in UNIVERSAL_DATA: {timestamp}")
-                                        dt = datetime.fromtimestamp(timestamp)
-                                        return dt.strftime('%Y-%m-%d')
+                                        date_str = self._convert_timestamp_to_date(timestamp)
+                                        if date_str:
+                                            return date_str
                                 
                                 # Try direct item path
                                 if 'item' in video_detail and 'createTime' in video_detail['item']:
                                     timestamp = int(video_detail['item']['createTime'])
                                     logger.info(f"📅 Found video createTime in item: {timestamp}")
-                                    dt = datetime.fromtimestamp(timestamp)
-                                    return dt.strftime('%Y-%m-%d')
+                                    date_str = self._convert_timestamp_to_date(timestamp)
+                                    if date_str:
+                                        return date_str
                     except (json.JSONDecodeError, KeyError, ValueError) as e:
                         logger.debug(f"Failed to parse UNIVERSAL_DATA: {e}")
                 
@@ -118,8 +148,9 @@ class PlaywrightTikTokCrawler:
                                 if 'createTime' in video_data:
                                     timestamp = int(video_data['createTime'])
                                     logger.info(f"📅 Found video createTime in SIGI_STATE: {timestamp}")
-                                    dt = datetime.fromtimestamp(timestamp)
-                                    return dt.strftime('%Y-%m-%d')
+                                    date_str = self._convert_timestamp_to_date(timestamp)
+                                    if date_str:
+                                        return date_str
                     except (json.JSONDecodeError, KeyError, ValueError) as e:
                         logger.debug(f"Failed to parse SIGI_STATE: {e}")
                         
@@ -247,34 +278,37 @@ class PlaywrightTikTokCrawler:
                 
                 # Pattern 1: Look for video detail object with createTime
                 # This is more specific and targets the video data structure
-                video_detail_pattern = r'"video"[^}]*?"createTime"["\s:]*(\d{10})'
+                video_detail_pattern = r'"video"[^}]*?"createTime"["\s:]*(\d{10,13})'
                 matches = re.findall(video_detail_pattern, page_content, re.IGNORECASE)
                 if matches:
                     # Get the LAST match (more likely to be video, not account)
                     match = matches[-1]
                     logger.info(f"📅 Found video createTime in detail object: {match}")
-                    dt = datetime.fromtimestamp(int(match))
-                    return dt.strftime('%Y-%m-%d')
+                    date_str = self._convert_timestamp_to_date(int(match))
+                    if date_str:
+                        return date_str
                 
                 # Pattern 2: Look for itemInfo or itemStruct with createTime
-                item_pattern = r'"(?:itemInfo|itemStruct|itemModule)"[^}]*?"createTime"["\s:]*(\d{10})'
+                item_pattern = r'"(?:itemInfo|itemStruct|itemModule)"[^}]*?"createTime"["\s:]*(\d{10,13})'
                 matches = re.findall(item_pattern, page_content, re.IGNORECASE)
                 if matches:
                     match = matches[0]  # First match in itemInfo is usually the video
                     logger.info(f"📅 Found video createTime in itemInfo: {match}")
-                    dt = datetime.fromtimestamp(int(match))
-                    return dt.strftime('%Y-%m-%d')
+                    date_str = self._convert_timestamp_to_date(int(match))
+                    if date_str:
+                        return date_str
                 
                 # Pattern 3: Look for "createTime" NOT in "author" or "user" context
                 # This excludes account creation time
-                non_author_pattern = r'(?<!"author"[^}]{0,500})"createTime"["\s:]*(\d{10})(?![^}]*?"nickname")'
+                non_author_pattern = r'(?<!"author"[^}]{0,500})"createTime"["\s:]*(\d{10,13})(?![^}]*?"nickname")'
                 matches = re.findall(non_author_pattern, page_content)
                 if matches:
                     # Use LAST match as it's more likely to be video data
                     match = matches[-1]
                     logger.info(f"📅 Found createTime (non-author context): {match}")
-                    dt = datetime.fromtimestamp(int(match))
-                    return dt.strftime('%Y-%m-%d')
+                    date_str = self._convert_timestamp_to_date(int(match))
+                    if date_str:
+                        return date_str
                 
                 # Pattern 4: Fallback - ISO format dates
                 patterns = [
