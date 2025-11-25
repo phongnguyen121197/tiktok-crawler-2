@@ -108,30 +108,51 @@ class PlaywrightTikTokCrawler:
                         # Path: __DEFAULT_SCOPE__['webapp.video-detail']['itemInfo']['itemStruct']['createTime']
                         if '__DEFAULT_SCOPE__' in data:
                             scope = data['__DEFAULT_SCOPE__']
+                            logger.debug(f"Found __DEFAULT_SCOPE__ with keys: {list(scope.keys())}")
                             
                             # Check video-detail path
                             if 'webapp.video-detail' in scope:
                                 video_detail = scope['webapp.video-detail']
+                                logger.debug(f"Found webapp.video-detail with keys: {list(video_detail.keys())}")
                                 
                                 # Try itemInfo path
                                 if 'itemInfo' in video_detail and 'itemStruct' in video_detail['itemInfo']:
                                     item = video_detail['itemInfo']['itemStruct']
                                     if 'createTime' in item:
-                                        timestamp = int(item['createTime'])
-                                        logger.info(f"📅 Found video createTime in UNIVERSAL_DATA: {timestamp}")
-                                        date_str = self._convert_timestamp_to_date(timestamp)
-                                        if date_str:
-                                            return date_str
+                                        try:
+                                            timestamp = item['createTime']
+                                            # Handle different formats
+                                            if isinstance(timestamp, str):
+                                                timestamp = int(timestamp)
+                                            logger.info(f"📅 Found video createTime in UNIVERSAL_DATA: {timestamp}")
+                                            date_str = self._convert_timestamp_to_date(timestamp)
+                                            if date_str:
+                                                return date_str
+                                        except Exception as e:
+                                            logger.warning(f"Failed to convert createTime from itemStruct: {e}")
                                 
                                 # Try direct item path
                                 if 'item' in video_detail and 'createTime' in video_detail['item']:
-                                    timestamp = int(video_detail['item']['createTime'])
-                                    logger.info(f"📅 Found video createTime in item: {timestamp}")
-                                    date_str = self._convert_timestamp_to_date(timestamp)
-                                    if date_str:
-                                        return date_str
+                                    try:
+                                        timestamp = video_detail['item']['createTime']
+                                        if isinstance(timestamp, str):
+                                            timestamp = int(timestamp)
+                                        logger.info(f"📅 Found video createTime in item: {timestamp}")
+                                        date_str = self._convert_timestamp_to_date(timestamp)
+                                        if date_str:
+                                            return date_str
+                                    except Exception as e:
+                                        logger.warning(f"Failed to convert createTime from item: {e}")
+                            else:
+                                logger.debug(f"No webapp.video-detail in scope. Available keys: {list(scope.keys())}")
+                                # Try alternative paths
+                                for key in scope.keys():
+                                    if 'video' in key.lower() or 'item' in key.lower():
+                                        logger.debug(f"Found alternative key: {key}")
+                        else:
+                            logger.debug(f"No __DEFAULT_SCOPE__ in UNIVERSAL_DATA. Top-level keys: {list(data.keys())}")
                     except (json.JSONDecodeError, KeyError, ValueError) as e:
-                        logger.debug(f"Failed to parse UNIVERSAL_DATA: {e}")
+                        logger.warning(f"Failed to parse UNIVERSAL_DATA: {e}")
                 
                 # Alternative: Look for SIGI_STATE
                 sigi_pattern = r'<script id="SIGI_STATE"[^>]*>(.*?)</script>'
@@ -141,18 +162,27 @@ class PlaywrightTikTokCrawler:
                     try:
                         data_str = match.group(1)
                         data = json.loads(data_str)
+                        logger.debug(f"Found SIGI_STATE with keys: {list(data.keys())}")
                         
                         # Look for ItemModule with video data
                         if 'ItemModule' in data:
+                            logger.debug(f"Found ItemModule with {len(data['ItemModule'])} items")
                             for video_id, video_data in data['ItemModule'].items():
                                 if 'createTime' in video_data:
-                                    timestamp = int(video_data['createTime'])
-                                    logger.info(f"📅 Found video createTime in SIGI_STATE: {timestamp}")
-                                    date_str = self._convert_timestamp_to_date(timestamp)
-                                    if date_str:
-                                        return date_str
+                                    try:
+                                        timestamp = video_data['createTime']
+                                        if isinstance(timestamp, str):
+                                            timestamp = int(timestamp)
+                                        logger.info(f"📅 Found video createTime in SIGI_STATE: {timestamp}")
+                                        date_str = self._convert_timestamp_to_date(timestamp)
+                                        if date_str:
+                                            return date_str
+                                    except Exception as e:
+                                        logger.warning(f"Failed to convert createTime from SIGI_STATE: {e}")
+                        else:
+                            logger.debug("No ItemModule in SIGI_STATE")
                     except (json.JSONDecodeError, KeyError, ValueError) as e:
-                        logger.debug(f"Failed to parse SIGI_STATE: {e}")
+                        logger.warning(f"Failed to parse SIGI_STATE: {e}")
                         
             except Exception as e:
                 logger.debug(f"TikTok embedded data method failed: {e}")
