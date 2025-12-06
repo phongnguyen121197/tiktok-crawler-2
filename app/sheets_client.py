@@ -4,6 +4,7 @@ from typing import List, Dict, Optional
 from datetime import datetime
 import logging
 import time
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +12,7 @@ class GoogleSheetsClient:
     """
     Google Sheets client with deduplication and rate limit handling
     Prevents duplicate records and handles API quota limits
-    NOW WITH PUBLISHED DATE COLUMN! 📅
+    NOW WITH PUBLISHED DATE COLUMN + VALIDATION! 📅
     """
     
     def __init__(self, credentials_json: dict, sheet_id: str):
@@ -44,6 +45,90 @@ class GoogleSheetsClient:
         except Exception as e:
             logger.error(f"❌ Failed to initialize Google Sheets client: {e}")
             raise
+    
+    def _validate_and_format_publish_date(self, publish_date) -> str:
+        """
+        Validate and format publish_date before writing to Sheets
+        
+        ✅ CRITICAL FIX: Ensures only valid date strings are written
+        
+        Args:
+            publish_date: The publish_date value (could be string, int, None)
+            
+        Returns:
+            str: Formatted date string (YYYY-MM-DD) or empty string
+        """
+        if not publish_date:
+            return ''
+        
+        # If it's already a valid date string (YYYY-MM-DD)
+        if isinstance(publish_date, str):
+            if re.match(r'^\d{4}-\d{2}-\d{2}$', publish_date):
+                logger.debug(f"📅 Valid date string: {publish_date}")
+                return publish_date
+            
+            # Try to parse other date formats
+            try:
+                # ISO format with time
+                if 'T' in publish_date:
+                    dt = datetime.fromisoformat(publish_date.replace('Z', '+00:00'))
+                    return dt.strftime('%Y-%m-%d')
+            except:
+                pass
+            
+            # If it's a numeric string (timestamp), convert it
+            if publish_date.isdigit():
+                return self._convert_timestamp_to_date(int(publish_date))
+            
+            logger.warning(f"⚠️ Invalid date string format: {publish_date}")
+            return ''
+        
+        # If it's a number (timestamp), convert it
+        if isinstance(publish_date, (int, float)):
+            logger.warning(f"⚠️ publish_date is a number ({publish_date}), converting to date string")
+            return self._convert_timestamp_to_date(publish_date)
+        
+        logger.warning(f"⚠️ Unknown publish_date type: {type(publish_date)} = {publish_date}")
+        return ''
+    
+    def _convert_timestamp_to_date(self, timestamp) -> str:
+        """
+        Convert Unix timestamp to YYYY-MM-DD format
+        Handles both 10-digit (seconds) and 13-digit (milliseconds)
+        
+        Args:
+            timestamp: Unix timestamp
+            
+        Returns:
+            str: Date string or empty string on error
+        """
+        try:
+            if not timestamp:
+                return ''
+            
+            # Convert to float if string
+            if isinstance(timestamp, str):
+                timestamp = float(timestamp)
+            
+            # Handle 13-digit milliseconds
+            if timestamp > 9999999999:  # More than 10 digits = milliseconds
+                timestamp = timestamp / 1000
+            
+            # Convert to datetime
+            dt = datetime.fromtimestamp(timestamp)
+            
+            # Validate year is reasonable (2016-2030 for TikTok)
+            if dt.year < 2016 or dt.year > 2030:
+                logger.warning(f"⚠️ Timestamp {timestamp} produced invalid year: {dt.year}")
+                return ''
+            
+            formatted = dt.strftime('%Y-%m-%d')
+            logger.debug(f"📅 Converted timestamp {timestamp} to {formatted}")
+            return formatted
+            
+        except Exception as e:
+            logger.error(f"❌ Error converting timestamp {timestamp}: {e}")
+            return ''
     
     def get_all_records_with_index(self) -> Dict[str, int]:
         """
@@ -84,7 +169,7 @@ class GoogleSheetsClient:
     def batch_update_records(self, records: List[Dict]) -> tuple:
         """
         Update or insert records with deduplication and rate limit handling
-        NOW INCLUDES PUBLISHED DATE! 📅
+        NOW WITH PUBLISH_DATE VALIDATION! 📅
         
         Args:
             records: List of record dicts with keys:
@@ -159,29 +244,35 @@ class GoogleSheetsClient:
         
         for idx, (row_index, record) in enumerate(to_update, 1):
             try:
+                # ✅ CRITICAL: Validate publish_date before writing
+                raw_publish_date = record.get('publish_date')
+                validated_publish_date = self._validate_and_format_publish_date(raw_publish_date)
+                
+                # 📝 DEBUG LOG: Show what we're writing
+                logger.info(f"📅 Record {record['record_id']}: publish_date raw={raw_publish_date} -> validated={validated_publish_date}")
+                
                 # Prepare row data
                 # Columns: Record ID | Link TikTok | Current Views | 24h Baseline | Published Date | Last Check | Status
                 row_data = [
                     [
-                        record['record_id'],
-                        record['link'],
+                        str(record['record_id']),
+                        str(record['link']),
                         record['views'],
                         record['baseline'],
-                        record.get('publish_date', ''),  # 📅 NEW COLUMN
+                        validated_publish_date,  # ✅ VALIDATED publish_date
                         timestamp,
-                        record['status']
+                        str(record['status'])
                     ]
                 ]
                 
                 # Update the row
-                range_name = f'A{row_index}:G{row_index}'  # Extended to column G
+                range_name = f'A{row_index}:G{row_index}'
                 self.worksheet.update(range_name, row_data, value_input_option='USER_ENTERED')
                 
                 updated_count += 1
                 
-                # ✅ CRITICAL: Rate limiting to avoid Google API quota (60 writes/min)
-                # Sleep 1.2 seconds = 50 writes/minute (safely under 60 limit)
-                if idx < len(to_update):  # Don't sleep after last update
+                # Rate limiting
+                if idx < len(to_update):
                     time.sleep(1.2)
                 
                 if idx % 10 == 0:
@@ -197,15 +288,18 @@ class GoogleSheetsClient:
                     
                     # Retry this record
                     try:
+                        raw_publish_date = record.get('publish_date')
+                        validated_publish_date = self._validate_and_format_publish_date(raw_publish_date)
+                        
                         row_data = [
                             [
-                                record['record_id'],
-                                record['link'],
+                                str(record['record_id']),
+                                str(record['link']),
                                 record['views'],
                                 record['baseline'],
-                                record.get('publish_date', ''),
+                                validated_publish_date,
                                 timestamp,
-                                record['status']
+                                str(record['status'])
                             ]
                         ]
                         range_name = f'A{row_index}:G{row_index}'
@@ -238,16 +332,22 @@ class GoogleSheetsClient:
         
         for idx, record in enumerate(to_insert, 1):
             try:
+                # ✅ CRITICAL: Validate publish_date before writing
+                raw_publish_date = record.get('publish_date')
+                validated_publish_date = self._validate_and_format_publish_date(raw_publish_date)
+                
+                # 📝 DEBUG LOG
+                logger.info(f"📅 INSERT {record['record_id']}: publish_date raw={raw_publish_date} -> validated={validated_publish_date}")
+                
                 # Prepare row data
-                # Columns: Record ID | Link TikTok | Current Views | 24h Baseline | Published Date | Last Check | Status
                 row_data = [
-                    record['record_id'],
-                    record['link'],
+                    str(record['record_id']),
+                    str(record['link']),
                     record['views'],
                     record['baseline'],
-                    record.get('publish_date', ''),  # 📅 NEW COLUMN
+                    validated_publish_date,  # ✅ VALIDATED publish_date
                     timestamp,
-                    record['status']
+                    str(record['status'])
                 ]
                 
                 # Append new row
@@ -255,7 +355,7 @@ class GoogleSheetsClient:
                 
                 inserted_count += 1
                 
-                # ✅ CRITICAL: Rate limiting
+                # Rate limiting
                 if idx < len(to_insert):
                     time.sleep(1.2)
                 
@@ -272,14 +372,17 @@ class GoogleSheetsClient:
                     
                     # Retry
                     try:
+                        raw_publish_date = record.get('publish_date')
+                        validated_publish_date = self._validate_and_format_publish_date(raw_publish_date)
+                        
                         row_data = [
-                            record['record_id'],
-                            record['link'],
+                            str(record['record_id']),
+                            str(record['link']),
                             record['views'],
                             record['baseline'],
-                            record.get('publish_date', ''),
+                            validated_publish_date,
                             timestamp,
-                            record['status']
+                            str(record['status'])
                         ]
                         self.worksheet.append_row(row_data, value_input_option='USER_ENTERED')
                         inserted_count += 1
@@ -331,6 +434,54 @@ class GoogleSheetsClient:
                 
         except Exception as e:
             logger.error(f"❌ Error removing duplicates: {e}")
+    
+    def fix_timestamp_dates(self) -> int:
+        """
+        🔧 MIGRATION: Convert all timestamp values in column E to date strings
+        
+        Finds cells in column E that contain 10 or 13 digit numbers
+        and converts them to YYYY-MM-DD format
+        
+        Returns:
+            Number of cells fixed
+        """
+        try:
+            logger.info("🔧 Starting timestamp migration for column E (Published Date)...")
+            
+            all_values = self.worksheet.get_all_values()
+            
+            if len(all_values) < 2:
+                logger.info("📋 No data to migrate")
+                return 0
+            
+            fixed_count = 0
+            publish_date_col = 4  # Column E (0-indexed)
+            
+            for row_idx, row in enumerate(all_values[1:], start=2):  # Skip header
+                if len(row) > publish_date_col:
+                    cell_value = row[publish_date_col]
+                    
+                    # Check if it's a timestamp (10-13 digits)
+                    if cell_value and cell_value.isdigit() and len(cell_value) >= 10:
+                        timestamp = int(cell_value)
+                        converted_date = self._convert_timestamp_to_date(timestamp)
+                        
+                        if converted_date:
+                            logger.info(f"  📅 Row {row_idx}: {cell_value} -> {converted_date}")
+                            
+                            # Update the cell
+                            self.worksheet.update_cell(row_idx, publish_date_col + 1, converted_date)
+                            fixed_count += 1
+                            
+                            # Rate limiting
+                            time.sleep(1.2)
+            
+            logger.info(f"✅ Migration complete: Fixed {fixed_count} timestamps")
+            return fixed_count
+            
+        except Exception as e:
+            logger.error(f"❌ Migration failed: {e}")
+            return 0
     
     def get_record_count(self) -> int:
         """Get total number of records (excluding header)"""

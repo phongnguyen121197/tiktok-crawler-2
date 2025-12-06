@@ -85,13 +85,15 @@ async def startup_event():
 async def root():
     return {
         "message": "TikTok View Crawler API", 
-        "version": "2.3.0",
+        "version": "2.4.0",
         "mode": "Playwright + Google Sheets + Lark Bitable + Deduplication",
         "features": [
             "Direct TikTok scraping via Playwright",
+            "Published date extraction",
             "Automatic fallback to Lark data",
             "Duplicate prevention",
-            "Background job processing"
+            "Background job processing",
+            "Timestamp migration support"
         ]
     }
 
@@ -273,6 +275,118 @@ async def crawl_batch(request: CrawlRequest, background_tasks: BackgroundTasks):
         "timestamp": datetime.now().isoformat()
     }
 
+# ✅ NEW: Migration endpoint to fix old timestamps
+@app.post("/jobs/fix-timestamps")
+async def fix_timestamps(background_tasks: BackgroundTasks):
+    """
+    🔧 MIGRATION: Convert timestamps in column E to date strings
+    
+    This will find all cells in column E (Published Date) that contain
+    10 or 13 digit numbers and convert them to YYYY-MM-DD format.
+    
+    Example:
+        1758128400000 -> 2025-09-18
+    """
+    
+    if not sheets_client:
+        raise HTTPException(status_code=500, detail="Sheets client not initialized")
+    
+    def migration_task():
+        try:
+            logger.info("🔧 Starting timestamp migration...")
+            fixed_count = sheets_client.fix_timestamp_dates()
+            logger.info(f"✅ Migration completed: Fixed {fixed_count} timestamps")
+        except Exception as e:
+            logger.error(f"❌ Migration failed: {e}", exc_info=True)
+    
+    background_tasks.add_task(migration_task)
+    
+    logger.info("🔧 Timestamp migration job started in background")
+    return {
+        "success": True,
+        "status": "started",
+        "message": "Timestamp migration started in background",
+        "description": "Converting timestamps in column E to YYYY-MM-DD format",
+        "timestamp": datetime.now().isoformat()
+    }
+
+# ✅ NEW: Analyze dates endpoint (check before migration)
+@app.get("/analyze/dates")
+async def analyze_dates():
+    """
+    📊 Analyze the Published Date column (E) to see what needs fixing
+    
+    Returns counts of:
+    - Valid dates (YYYY-MM-DD format)
+    - Timestamps (need conversion)
+    - Empty cells
+    """
+    
+    if not sheets_client:
+        raise HTTPException(status_code=500, detail="Sheets client not initialized")
+    
+    try:
+        logger.info("📊 Analyzing Published Date column...")
+        
+        all_values = sheets_client.worksheet.get_all_values()
+        
+        if len(all_values) < 2:
+            return {
+                "success": True,
+                "message": "Sheet is empty or has only headers",
+                "analysis": {
+                    "total_rows": 0,
+                    "valid_dates": 0,
+                    "timestamps": 0,
+                    "empty_cells": 0
+                }
+            }
+        
+        publish_date_col = 4  # Column E (0-indexed)
+        timestamps = []
+        valid_dates = []
+        empty_cells = []
+        other = []
+        
+        for row_idx, row in enumerate(all_values[1:], start=2):  # Skip header
+            if len(row) > publish_date_col:
+                cell_value = str(row[publish_date_col]).strip()
+                
+                if not cell_value:
+                    empty_cells.append(row_idx)
+                elif cell_value.isdigit() and len(cell_value) >= 10:
+                    timestamps.append({
+                        "row": row_idx,
+                        "value": cell_value,
+                        "converted": sheets_client._convert_timestamp_to_date(int(cell_value))
+                    })
+                elif len(cell_value) == 10 and '-' in cell_value:  # YYYY-MM-DD
+                    valid_dates.append(row_idx)
+                else:
+                    other.append({"row": row_idx, "value": cell_value})
+        
+        return {
+            "success": True,
+            "message": "Analysis complete",
+            "analysis": {
+                "total_rows": len(all_values) - 1,
+                "valid_dates": len(valid_dates),
+                "timestamps_to_fix": len(timestamps),
+                "empty_cells": len(empty_cells),
+                "other_format": len(other)
+            },
+            "sample_timestamps": timestamps[:5],
+            "sample_other": other[:5],
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Analysis failed: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
+
 # ✅ IMPROVED: Better global exception handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
@@ -307,13 +421,11 @@ async def debug_info():
             "crawler_initialized": crawler is not None,
             "playwright_available": crawler.use_playwright if crawler else False
         },
-        "version": "2.3.0",
+        "version": "2.4.0",
         "timestamp": datetime.now().isoformat()
     }
 
 # ✅ OPTIONAL: Support for direct run (useful for local testing)
-# This is NOT used in Railway (Railway uses Dockerfile CMD instead)
-# But it's useful if you want to run: python -m app.main
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
