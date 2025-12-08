@@ -1,35 +1,30 @@
 """
-🚀 OPTIMIZED TikTok Crawler
-===========================
-Uses BATCH processing instead of sequential crawling
-Expected: 550 videos in 30-45 minutes (was 2 hours)
+🚀 OPTIMIZED TikTok Crawler - FIXED VERSION
+============================================
+Fixed async handling for FastAPI compatibility
+Better error handling and logging
 """
 
 import logging
 from typing import List, Dict, Optional
 from datetime import datetime
 
+logger = logging.getLogger(__name__)
+
 # Import optimized Playwright crawler
 try:
-    from app.playwright_crawler import TikTokPlaywrightCrawler, OptimizedTikTokCrawler, CrawlerConfig
+    from app.playwright_crawler import TikTokPlaywrightCrawler, CrawlerConfig
     PLAYWRIGHT_AVAILABLE = True
-except ImportError:
+    logger.info("✅ Playwright crawler module imported successfully")
+except ImportError as e:
     PLAYWRIGHT_AVAILABLE = False
-    logging.warning("⚠️ Playwright not available")
-
-import asyncio
-
-logger = logging.getLogger(__name__)
+    logger.warning(f"⚠️ Playwright not available: {e}")
 
 
 class TikTokCrawler:
     """
     TikTok Crawler with OPTIMIZED batch processing
-    
-    Key changes from original:
-    1. Uses batch crawling (10-12 concurrent) instead of sequential
-    2. Collects all URLs first, then crawls in parallel
-    3. Single batch update to Sheets instead of one-by-one
+    FIXED: Better error handling and logging
     """
     
     def __init__(self, lark_client, sheets_client, use_playwright=True):
@@ -38,15 +33,20 @@ class TikTokCrawler:
         self.use_playwright = use_playwright and PLAYWRIGHT_AVAILABLE
         
         if self.use_playwright:
-            self.playwright_crawler = TikTokPlaywrightCrawler()
-            logger.info("✅ Optimized Playwright crawler initialized")
+            try:
+                self.playwright_crawler = TikTokPlaywrightCrawler()
+                logger.info("✅ Optimized Playwright crawler initialized")
+            except Exception as e:
+                logger.error(f"❌ Failed to init Playwright crawler: {e}")
+                self.playwright_crawler = None
+                self.use_playwright = False
         else:
             self.playwright_crawler = None
         
         logger.info(f"🔧 Crawler mode: {'Optimized Parallel' if self.use_playwright else 'Fallback only'}")
     
     def extract_lark_field_value(self, field_data, field_type: str = 'text'):
-        """Extract value from Lark field (handles different formats)"""
+        """Extract value from Lark field"""
         try:
             if not field_data:
                 return None
@@ -93,13 +93,7 @@ class TikTokCrawler:
     def crawl_all_videos(self) -> Dict:
         """
         🚀 OPTIMIZED Main crawler function
-        
-        New approach:
-        1. Get all records from Lark
-        2. Extract all URLs
-        3. Batch crawl ALL URLs in parallel (10-12 concurrent)
-        4. Match results back to records
-        5. Batch update to Sheets
+        FIXED: Better error handling
         """
         try:
             start_time = datetime.now()
@@ -115,9 +109,9 @@ class TikTokCrawler:
             
             logger.info(f"✅ Fetched {len(lark_records)} records from Lark")
             
-            # Step 2: Extract URLs and build lookup
+            # Step 2: Extract URLs
             logger.info("🔗 Extracting URLs from records...")
-            url_to_record = {}  # {url: lark_record}
+            url_to_record = {}
             urls_to_crawl = []
             
             for lark_record in lark_records:
@@ -136,20 +130,34 @@ class TikTokCrawler:
             if not urls_to_crawl:
                 return self._error_result("No valid URLs found")
             
-            # Step 3: BATCH CRAWL all URLs in parallel! 🚀
+            # Step 3: BATCH CRAWL
             logger.info(f"⚡ Starting parallel crawl of {len(urls_to_crawl)} URLs...")
             
+            crawl_results = []
+            
             if self.use_playwright and self.playwright_crawler:
-                crawl_results = self.playwright_crawler.crawl_batch_sync(urls_to_crawl)
-            else:
-                # Fallback: no crawling, use Lark data only
+                try:
+                    logger.info("🎯 Using Playwright batch crawler...")
+                    crawl_results = self.playwright_crawler.crawl_batch_sync(urls_to_crawl)
+                    logger.info(f"✅ Playwright returned {len(crawl_results)} results")
+                except Exception as e:
+                    logger.error(f"❌ Playwright crawl failed: {e}", exc_info=True)
+                    crawl_results = []
+            
+            # If Playwright failed or returned empty, create empty results
+            if not crawl_results:
+                logger.warning("⚠️ No crawl results, using Lark data only")
                 crawl_results = [{'url': url, 'success': False} for url in urls_to_crawl]
             
             # Build results lookup
-            results_by_url = {r['url']: r for r in crawl_results if r}
+            results_by_url = {}
+            for r in crawl_results:
+                if r and r.get('url'):
+                    results_by_url[r['url']] = r
             
-            # Step 4: Process results and prepare Sheets data
-            logger.info("📊 Processing results...")
+            logger.info(f"📊 Processing {len(results_by_url)} crawl results...")
+            
+            # Step 4: Process results
             processed_records = []
             success_count = 0
             partial_count = 0
@@ -160,7 +168,6 @@ class TikTokCrawler:
                 fields = lark_record.get('fields', {})
                 record_id = lark_record.get('id', '')
                 
-                # Get Lark fallback data
                 views_lark = self.extract_lark_field_value(
                     fields.get('Lượt xem hiện tại', []), 'number'
                 )
@@ -168,7 +175,6 @@ class TikTokCrawler:
                     fields.get('Số view 24h trước', []), 'number'
                 )
                 
-                # Determine final values
                 if crawl_result.get('success'):
                     current_views = crawl_result.get('views', views_lark or 0)
                     publish_date = crawl_result.get('publish_date', '')
@@ -198,7 +204,12 @@ class TikTokCrawler:
             
             # Step 5: Batch update to Sheets
             logger.info("📊 Updating Google Sheets...")
-            updated, inserted = self.sheets_client.batch_update_records(processed_records)
+            try:
+                updated, inserted = self.sheets_client.batch_update_records(processed_records)
+                logger.info(f"✅ Sheets updated: {updated} updated, {inserted} inserted")
+            except Exception as e:
+                logger.error(f"❌ Sheets update failed: {e}")
+                updated, inserted = 0, 0
             
             # Calculate duration
             duration = (datetime.now() - start_time).total_seconds()
@@ -239,10 +250,7 @@ class TikTokCrawler:
             return self._error_result(str(e))
     
     def crawl_videos_batch(self, record_ids: List[str] = None) -> Dict:
-        """
-        Crawl specific videos by Record IDs (or all if None)
-        Uses the same optimized batch approach
-        """
+        """Crawl specific videos by Record IDs"""
         try:
             logger.info("🚀 Starting batch crawler...")
             
@@ -254,7 +262,6 @@ class TikTokCrawler:
             else:
                 lark_records = all_records
             
-            # Extract URLs
             urls_to_crawl = []
             url_to_record = {}
             
@@ -265,15 +272,15 @@ class TikTokCrawler:
                     urls_to_crawl.append(link)
                     url_to_record[link] = record
             
-            # Batch crawl
+            crawl_results = []
             if self.use_playwright and self.playwright_crawler:
-                crawl_results = self.playwright_crawler.crawl_batch_sync(urls_to_crawl)
-            else:
-                crawl_results = []
+                try:
+                    crawl_results = self.playwright_crawler.crawl_batch_sync(urls_to_crawl)
+                except Exception as e:
+                    logger.error(f"❌ Batch crawl failed: {e}")
             
             results_by_url = {r['url']: r for r in crawl_results if r}
             
-            # Process
             processed_records = []
             for url, record in url_to_record.items():
                 result = results_by_url.get(url, {})
@@ -326,9 +333,8 @@ class TikTokCrawler:
             }
         }
     
-    # Legacy method for backward compatibility
     def get_tiktok_views(self, video_url: str) -> Optional[Dict]:
-        """Get single video stats (for backward compatibility)"""
+        """Get single video stats (backward compatibility)"""
         if self.use_playwright and self.playwright_crawler:
             return self.playwright_crawler.get_tiktok_views(video_url)
         return None
