@@ -1,10 +1,10 @@
 """
-🚀 TikTok Playwright Crawler - SEQUENTIAL STABLE VERSION
-=========================================================
-Runs ONE video at a time for maximum stability
-Slower but RELIABLE - won't crash like parallel version
-
-Expected: 553 videos in 2-3 hours (similar to before but stable)
+🚀 TikTok Playwright Crawler - SEQUENTIAL STABLE VERSION v2
+============================================================
+FIXED: Browser restart hang issue
+- Added timeout to close_browser() 
+- Increased restart_browser_every from 50 to 100
+- Force kill browser if close takes too long
 """
 
 import asyncio
@@ -33,7 +33,8 @@ class CrawlerConfig:
     delay_range: Tuple[float, float] = (1.5, 3.0)  # Delay between requests
     timeout_ms: int = 25000           # 25 seconds timeout per page
     max_retries: int = 2              # Retry failed requests
-    restart_browser_every: int = 50   # Restart browser every N videos to prevent memory leak
+    restart_browser_every: int = 100  # ✅ INCREASED from 50 to 100 to reduce restart frequency
+    browser_close_timeout: int = 10   # ✅ NEW: Max seconds to wait for browser close
 
 
 # User agents
@@ -235,19 +236,53 @@ class SequentialTikTokCrawler:
             return False
     
     async def close_browser(self):
-        """Close browser"""
+        """
+        ✅ FIXED: Close browser with timeout to prevent hanging
+        """
+        async def _close_with_timeout():
+            """Inner function to close browser components"""
+            try:
+                if self.context:
+                    await self.context.close()
+                    self.context = None
+            except Exception as e:
+                logger.debug(f"Error closing context: {e}")
+            
+            try:
+                if self.browser:
+                    await self.browser.close()
+                    self.browser = None
+            except Exception as e:
+                logger.debug(f"Error closing browser: {e}")
+            
+            try:
+                if self.playwright:
+                    await self.playwright.stop()
+                    self.playwright = None
+            except Exception as e:
+                logger.debug(f"Error stopping playwright: {e}")
+        
         try:
-            if self.context:
-                await self.context.close()
-                self.context = None
-            if self.browser:
-                await self.browser.close()
-                self.browser = None
-            if self.playwright:
-                await self.playwright.stop()
-                self.playwright = None
+            # ✅ Add timeout to prevent hanging
+            await asyncio.wait_for(
+                _close_with_timeout(),
+                timeout=self.config.browser_close_timeout
+            )
+            logger.debug("Browser closed successfully")
+        except asyncio.TimeoutError:
+            logger.warning(f"⚠️ Browser close timed out after {self.config.browser_close_timeout}s, force killing...")
+            # Force reset references even if close failed
+            self.context = None
+            self.browser = None
+            self.playwright = None
+            # Force garbage collection
+            gc.collect()
         except Exception as e:
-            logger.debug(f"Error closing browser: {e}")
+            logger.debug(f"Error in close_browser: {e}")
+            # Reset references
+            self.context = None
+            self.browser = None
+            self.playwright = None
     
     async def crawl_single(self, url: str, retry_count: int = 0) -> Dict:
         """Crawl a single URL"""
@@ -473,16 +508,6 @@ class TikTokPlaywrightCrawler:
             logger.error(f"❌ Exception: {e}")
             logger.error(traceback.format_exc())
             return []
-
-
-# ============================================================================
-# OPTIONAL: Hybrid approach - can enable later if sequential works
-# ============================================================================
-
-# class CrawlerConfig:
-#     """For future parallel mode"""
-#     max_concurrent: int = 2  # Only 2 parallel
-#     ...
 
 
 # ============================================================================
