@@ -4,7 +4,6 @@ from typing import List, Dict, Optional
 from datetime import datetime
 import logging
 import time
-import re
 
 logger = logging.getLogger(__name__)
 
@@ -12,8 +11,7 @@ class GoogleSheetsClient:
     """
     Google Sheets client with deduplication and rate limit handling
     Prevents duplicate records and handles API quota limits
-    
-    ✅ v2.5.0 - OPTIMIZED: Only update Published Date when needed
+    NOW WITH PUBLISHED DATE COLUMN! 📅
     """
     
     def __init__(self, credentials_json: dict, sheet_id: str):
@@ -47,129 +45,34 @@ class GoogleSheetsClient:
             logger.error(f"❌ Failed to initialize Google Sheets client: {e}")
             raise
     
-    def _is_valid_date_format(self, value: str) -> bool:
+    def get_all_records_with_index(self) -> Dict[str, int]:
         """
-        ✅ NEW: Check if value is a valid date in YYYY-MM-DD format
+        Get all existing records with their row indices
+        Returns dict: {record_id: row_index}
         
-        Args:
-            value: String to check
-            
-        Returns:
-            bool: True if valid YYYY-MM-DD format
-        """
-        if not value or not isinstance(value, str):
-            return False
-        
-        # Check format YYYY-MM-DD
-        if not re.match(r'^\d{4}-\d{2}-\d{2}$', value.strip()):
-            return False
-        
-        # Validate actual date
-        try:
-            datetime.strptime(value.strip(), '%Y-%m-%d')
-            return True
-        except ValueError:
-            return False
-    
-    def _validate_and_format_publish_date(self, publish_date) -> str:
-        """
-        Validate and format publish_date before writing to Sheets
-        
-        Args:
-            publish_date: The publish_date value (could be string, int, None)
-            
-        Returns:
-            str: Formatted date string (YYYY-MM-DD) or empty string
-        """
-        if not publish_date:
-            return ''
-        
-        # If it's already a valid date string (YYYY-MM-DD)
-        if isinstance(publish_date, str):
-            if re.match(r'^\d{4}-\d{2}-\d{2}$', publish_date):
-                return publish_date
-            
-            # Try to parse other date formats
-            try:
-                if 'T' in publish_date:
-                    dt = datetime.fromisoformat(publish_date.replace('Z', '+00:00'))
-                    return dt.strftime('%Y-%m-%d')
-            except:
-                pass
-            
-            # If it's a numeric string (timestamp), convert it
-            if publish_date.isdigit():
-                return self._convert_timestamp_to_date(int(publish_date))
-            
-            return ''
-        
-        # If it's a number (timestamp), convert it
-        if isinstance(publish_date, (int, float)):
-            return self._convert_timestamp_to_date(publish_date)
-        
-        return ''
-    
-    def _convert_timestamp_to_date(self, timestamp) -> str:
-        """
-        Convert Unix timestamp to YYYY-MM-DD format
-        Handles both 10-digit (seconds) and 13-digit (milliseconds)
+        This is used for deduplication - checking which records already exist
         """
         try:
-            if not timestamp:
-                return ''
-            
-            if isinstance(timestamp, str):
-                timestamp = float(timestamp)
-            
-            if timestamp > 9999999999:
-                timestamp = timestamp / 1000
-            
-            dt = datetime.fromtimestamp(timestamp)
-            
-            if dt.year < 2016 or dt.year > 2030:
-                return ''
-            
-            return dt.strftime('%Y-%m-%d')
-            
-        except Exception as e:
-            logger.error(f"❌ Error converting timestamp {timestamp}: {e}")
-            return ''
-    
-    def get_all_records_with_index(self) -> Dict[str, dict]:
-        """
-        ✅ UPDATED: Get all existing records with their row indices AND existing data
-        Returns dict: {record_id: {'row': row_index, 'publish_date': existing_date}}
-        
-        This is used for:
-        - Deduplication
-        - Checking existing publish_date values
-        """
-        try:
+            # Get all values from sheet
             all_values = self.worksheet.get_all_values()
             
             if not all_values or len(all_values) < 2:
                 logger.info("📋 Sheet is empty or has only headers")
                 return {}
             
-            # Column indices (0-based):
-            # A=0: Record ID | B=1: Link | C=2: Views | D=3: Baseline | E=4: Published Date | F=5: Last Check | G=6: Status
-            record_id_col = 0
-            publish_date_col = 4
+            # First row is header
+            headers = all_values[0]
             
+            # Find Record ID column (column A, index 0)
+            record_id_col = 0
+            
+            # Build index: {record_id: row_number}
             record_index = {}
             for i, row in enumerate(all_values[1:], start=2):  # Start from row 2 (skip header)
                 if len(row) > record_id_col and row[record_id_col]:
                     record_id = row[record_id_col].strip()
                     if record_id:
-                        # Get existing publish_date if available
-                        existing_date = ''
-                        if len(row) > publish_date_col:
-                            existing_date = row[publish_date_col].strip() if row[publish_date_col] else ''
-                        
-                        record_index[record_id] = {
-                            'row': i,
-                            'publish_date': existing_date
-                        }
+                        record_index[record_id] = i
             
             logger.info(f"📊 Found {len(record_index)} existing records in sheet")
             return record_index
@@ -181,13 +84,16 @@ class GoogleSheetsClient:
     def batch_update_records(self, records: List[Dict]) -> tuple:
         """
         Update or insert records with deduplication and rate limit handling
-        
-        ✅ OPTIMIZED: Only update Published Date if:
-        - Cell is empty, OR
-        - Cell has invalid format (not YYYY-MM-DD)
+        NOW INCLUDES PUBLISHED DATE! 📅
         
         Args:
-            records: List of record dicts
+            records: List of record dicts with keys:
+                - record_id: Unique identifier
+                - link: TikTok video URL
+                - views: Current view count
+                - baseline: 24h baseline views
+                - publish_date: Video publish date (YYYY-MM-DD)
+                - status: 'success' or 'partial'
         
         Returns:
             Tuple (updated_count, inserted_count)
@@ -199,21 +105,19 @@ class GoogleSheetsClient:
             
             logger.info(f"📊 Processing {len(records)} records for batch update...")
             
-            # Get existing records WITH their publish_date values
+            # Get existing records
             existing_records = self.get_all_records_with_index()
             
             # Separate into updates and inserts
             records_dict = {r['record_id']: r for r in records}
             
-            to_update = []  # (row_index, record, existing_publish_date)
+            to_update = []  # (row_index, record)
             to_insert = []  # record
             
             for record_id, record in records_dict.items():
                 if record_id in existing_records:
-                    row_info = existing_records[record_id]
-                    row_index = row_info['row']
-                    existing_publish_date = row_info.get('publish_date', '')
-                    to_update.append((row_index, record, existing_publish_date))
+                    row_index = existing_records[record_id]
+                    to_update.append((row_index, record))
                 else:
                     to_insert.append(record)
             
@@ -239,10 +143,8 @@ class GoogleSheetsClient:
         """
         Update existing records with rate limiting
         
-        ✅ OPTIMIZED: Preserve existing valid publish_date
-        
         Args:
-            to_update: List of (row_index, record, existing_publish_date) tuples
+            to_update: List of (row_index, record) tuples
             
         Returns:
             Number of successfully updated records
@@ -252,52 +154,34 @@ class GoogleSheetsClient:
         
         updated_count = 0
         timestamp = datetime.now().isoformat()
-        dates_preserved = 0
-        dates_updated = 0
         
         logger.info(f"🔄 Updating {len(to_update)} existing records...")
         
-        for idx, (row_index, record, existing_publish_date) in enumerate(to_update, 1):
+        for idx, (row_index, record) in enumerate(to_update, 1):
             try:
-                # ✅ SMART PUBLISH DATE LOGIC
-                new_publish_date = record.get('publish_date', '')
-                validated_new_date = self._validate_and_format_publish_date(new_publish_date)
-                
-                # Decide which date to use
-                if self._is_valid_date_format(existing_publish_date):
-                    # ✅ KEEP existing valid date
-                    final_publish_date = existing_publish_date
-                    dates_preserved += 1
-                elif validated_new_date:
-                    # Use new date from crawler
-                    final_publish_date = validated_new_date
-                    dates_updated += 1
-                else:
-                    # Both empty or invalid
-                    final_publish_date = ''
-                
                 # Prepare row data
                 # Columns: Record ID | Link TikTok | Current Views | 24h Baseline | Published Date | Last Check | Status
                 row_data = [
                     [
-                        str(record['record_id']),
-                        str(record['link']),
+                        record['record_id'],
+                        record['link'],
                         record['views'],
                         record['baseline'],
-                        final_publish_date,  # ✅ Smart publish_date
+                        record.get('publish_date', ''),  # 📅 NEW COLUMN
                         timestamp,
-                        str(record['status'])
+                        record['status']
                     ]
                 ]
                 
                 # Update the row
-                range_name = f'A{row_index}:G{row_index}'
+                range_name = f'A{row_index}:G{row_index}'  # Extended to column G
                 self.worksheet.update(range_name, row_data, value_input_option='USER_ENTERED')
                 
                 updated_count += 1
                 
-                # Rate limiting
-                if idx < len(to_update):
+                # ✅ CRITICAL: Rate limiting to avoid Google API quota (60 writes/min)
+                # Sleep 1.2 seconds = 50 writes/minute (safely under 60 limit)
+                if idx < len(to_update):  # Don't sleep after last update
                     time.sleep(1.2)
                 
                 if idx % 10 == 0:
@@ -311,37 +195,27 @@ class GoogleSheetsClient:
                     logger.warning(f"⚠️ Rate limit hit, waiting 60 seconds...")
                     time.sleep(60)
                     
-                    # Retry
+                    # Retry this record
                     try:
-                        new_publish_date = record.get('publish_date', '')
-                        validated_new_date = self._validate_and_format_publish_date(new_publish_date)
-                        
-                        if self._is_valid_date_format(existing_publish_date):
-                            final_publish_date = existing_publish_date
-                        elif validated_new_date:
-                            final_publish_date = validated_new_date
-                        else:
-                            final_publish_date = ''
-                        
                         row_data = [
                             [
-                                str(record['record_id']),
-                                str(record['link']),
+                                record['record_id'],
+                                record['link'],
                                 record['views'],
                                 record['baseline'],
-                                final_publish_date,
+                                record.get('publish_date', ''),
                                 timestamp,
-                                str(record['status'])
+                                record['status']
                             ]
                         ]
                         range_name = f'A{row_index}:G{row_index}'
                         self.worksheet.update(range_name, row_data, value_input_option='USER_ENTERED')
                         updated_count += 1
+                        logger.info(f"  ✅ Retry successful for row {row_index}")
                     except Exception as retry_error:
                         logger.error(f"❌ Retry failed for row {row_index}: {retry_error}")
         
-        logger.info(f"✅ Updated {updated_count}/{len(to_update)} records")
-        logger.info(f"📅 Dates: {dates_preserved} preserved, {dates_updated} updated")
+        logger.info(f"✅ Updated {updated_count}/{len(to_update)} records successfully")
         return updated_count
     
     def _insert_records_with_rate_limit(self, to_insert: List[Dict]) -> int:
@@ -364,19 +238,16 @@ class GoogleSheetsClient:
         
         for idx, record in enumerate(to_insert, 1):
             try:
-                # Validate publish_date for new records
-                raw_publish_date = record.get('publish_date')
-                validated_publish_date = self._validate_and_format_publish_date(raw_publish_date)
-                
                 # Prepare row data
+                # Columns: Record ID | Link TikTok | Current Views | 24h Baseline | Published Date | Last Check | Status
                 row_data = [
-                    str(record['record_id']),
-                    str(record['link']),
+                    record['record_id'],
+                    record['link'],
                     record['views'],
                     record['baseline'],
-                    validated_publish_date,
+                    record.get('publish_date', ''),  # 📅 NEW COLUMN
                     timestamp,
-                    str(record['status'])
+                    record['status']
                 ]
                 
                 # Append new row
@@ -384,7 +255,7 @@ class GoogleSheetsClient:
                 
                 inserted_count += 1
                 
-                # Rate limiting
+                # ✅ CRITICAL: Rate limiting
                 if idx < len(to_insert):
                     time.sleep(1.2)
                 
@@ -401,20 +272,18 @@ class GoogleSheetsClient:
                     
                     # Retry
                     try:
-                        raw_publish_date = record.get('publish_date')
-                        validated_publish_date = self._validate_and_format_publish_date(raw_publish_date)
-                        
                         row_data = [
-                            str(record['record_id']),
-                            str(record['link']),
+                            record['record_id'],
+                            record['link'],
                             record['views'],
                             record['baseline'],
-                            validated_publish_date,
+                            record.get('publish_date', ''),
                             timestamp,
-                            str(record['status'])
+                            record['status']
                         ]
                         self.worksheet.append_row(row_data, value_input_option='USER_ENTERED')
                         inserted_count += 1
+                        logger.info(f"  ✅ Retry successful for record {record['record_id']}")
                     except Exception as retry_error:
                         logger.error(f"❌ Retry failed for {record['record_id']}: {retry_error}")
         
@@ -428,14 +297,20 @@ class GoogleSheetsClient:
         try:
             all_values = self.worksheet.get_all_values()
             
-            if len(all_values) < 3:
+            if len(all_values) < 3:  # Header + at least 2 rows
+                logger.info("📋 Not enough rows to check for duplicates")
                 return
             
+            headers = all_values[0]
+            data_rows = all_values[1:]
+            
+            # Track seen record IDs
             seen_ids = set()
             rows_to_delete = []
             
-            for i, row in enumerate(all_values[1:], start=2):
-                if len(row) > 0 and row[0]:
+            # Find duplicates (keep first, mark rest for deletion)
+            for i, row in enumerate(data_rows, start=2):  # Start from row 2
+                if len(row) > 0 and row[0]:  # Check if Record ID exists
                     record_id = row[0].strip()
                     if record_id in seen_ids:
                         rows_to_delete.append(i)
@@ -445,51 +320,17 @@ class GoogleSheetsClient:
             if rows_to_delete:
                 logger.info(f"🗑️ Found {len(rows_to_delete)} duplicate rows, removing...")
                 
+                # Delete from bottom to top (to maintain row indices)
                 for row_index in sorted(rows_to_delete, reverse=True):
                     self.worksheet.delete_rows(row_index)
-                    time.sleep(1.2)
+                    time.sleep(1.2)  # Rate limiting
                 
                 logger.info(f"✅ Removed {len(rows_to_delete)} duplicates")
+            else:
+                logger.info("✅ No duplicates found")
                 
         except Exception as e:
             logger.error(f"❌ Error removing duplicates: {e}")
-    
-    def fix_timestamp_dates(self) -> int:
-        """
-        🔧 MIGRATION: Convert all timestamp values in column E to date strings
-        """
-        try:
-            logger.info("🔧 Starting timestamp migration for column E (Published Date)...")
-            
-            all_values = self.worksheet.get_all_values()
-            
-            if len(all_values) < 2:
-                return 0
-            
-            fixed_count = 0
-            publish_date_col = 4
-            
-            for row_idx, row in enumerate(all_values[1:], start=2):
-                if len(row) > publish_date_col:
-                    cell_value = row[publish_date_col]
-                    
-                    # Check if it's a timestamp (10-13 digits)
-                    if cell_value and cell_value.isdigit() and len(cell_value) >= 10:
-                        timestamp = int(cell_value)
-                        converted_date = self._convert_timestamp_to_date(timestamp)
-                        
-                        if converted_date:
-                            logger.info(f"  📅 Row {row_idx}: {cell_value} -> {converted_date}")
-                            self.worksheet.update_cell(row_idx, publish_date_col + 1, converted_date)
-                            fixed_count += 1
-                            time.sleep(1.2)
-            
-            logger.info(f"✅ Migration complete: Fixed {fixed_count} timestamps")
-            return fixed_count
-            
-        except Exception as e:
-            logger.error(f"❌ Migration failed: {e}")
-            return 0
     
     def get_record_count(self) -> int:
         """Get total number of records (excluding header)"""
@@ -501,14 +342,21 @@ class GoogleSheetsClient:
             return 0
     
     def clear_all_data(self, keep_header: bool = True):
-        """Clear all data from sheet"""
+        """
+        Clear all data from sheet
+        
+        Args:
+            keep_header: If True, keep first row (header)
+        """
         try:
             if keep_header:
+                # Delete all rows except header
                 all_values = self.worksheet.get_all_values()
                 if len(all_values) > 1:
                     self.worksheet.delete_rows(2, len(all_values))
                     logger.info("✅ Cleared all data (kept header)")
             else:
+                # Clear everything
                 self.worksheet.clear()
                 logger.info("✅ Cleared entire sheet")
         except Exception as e:
