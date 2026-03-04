@@ -413,83 +413,101 @@ class TikTokCrawler:
                     cutoff_str = f"{today.year}-{today.month - 1:02d}"
                 logger.info(f"📅 Date filter: crawling {len(urls_to_crawl)} recent videos (>= {cutoff_str}), skipping {skipped_old} old videos")
             
-            # Step 3: Batch crawl with Playwright (only recent videos)
-            logger.info(f"🔄 Starting batch crawl with Playwright v3.2 ({len(urls_to_crawl)} videos)...")
-            crawl_results = {}
+            # Step 4: Batch crawl with Playwright + incremental Sheets write
+            # Process in batches of INCREMENTAL_BATCH_SIZE to save dates progressively
+            # If process is killed mid-run, dates from completed batches are already saved
+            INCREMENTAL_BATCH_SIZE = 100
+            total_to_crawl = len(urls_to_crawl)
+            logger.info(f"🔄 Starting incremental batch crawl v3.2 ({total_to_crawl} videos, batch size {INCREMENTAL_BATCH_SIZE})...")
             
-            if self.use_playwright and self.playwright_crawler:
-                try:
-                    # 📅 Pass existing_dates to crawler for priority handling
-                    # Only crawl recent videos (urls_to_crawl), not all urls
-                    results_list = self.playwright_crawler.crawl_batch_sync(urls_to_crawl, existing_dates=existing_dates)
-                    
-                    # Map results by URL
-                    for result in results_list:
-                        url = result.get('url', '')
-                        if url:
-                            crawl_results[url] = result
-                            
-                except Exception as e:
-                    logger.error(f"❌ Batch crawl error: {e}")
+            all_processed = []
+            total_updated = 0
+            total_inserted = 0
+            total_failed = 0
+            total_broken = 0
             
-            # Step 4: Process only recent records with crawl results (skip old videos)
-            logger.info("🔄 Processing recent records with crawl results...")
-            processed_records = []
-            failed_count = 0
-            broken_count = 0
-            
-            for idx, url in enumerate(urls_to_crawl, 1):
-                if idx % 50 == 0:
-                    logger.info(f"Processing records: {idx}/{len(urls_to_crawl)}")
+            for batch_start in range(0, total_to_crawl, INCREMENTAL_BATCH_SIZE):
+                batch_urls = urls_to_crawl[batch_start:batch_start + INCREMENTAL_BATCH_SIZE]
+                batch_num = batch_start // INCREMENTAL_BATCH_SIZE + 1
+                total_batches = (total_to_crawl + INCREMENTAL_BATCH_SIZE - 1) // INCREMENTAL_BATCH_SIZE
                 
-                try:
-                    record = record_by_url.get(url)
-                    if not record:
-                        continue
-                    
-                    tiktok_result = crawl_results.get(url)
-                    processed = self.process_lark_record(record, tiktok_result)
-                    
-                    if processed:
-                        processed_records.append(processed)
-                        if processed.get('is_broken'):
-                            broken_count += 1
-                        elif processed.get('status') != 'success':
-                            failed_count += 1
-                    else:
-                        failed_count += 1
+                logger.info(f"📦 Batch {batch_num}/{total_batches}: crawling {len(batch_urls)} videos (total progress: {batch_start}/{total_to_crawl})...")
+                
+                # Crawl this batch
+                crawl_results = {}
+                if self.use_playwright and self.playwright_crawler:
+                    try:
+                        results_list = self.playwright_crawler.crawl_batch_sync(batch_urls, existing_dates=existing_dates)
+                        for result in results_list:
+                            url = result.get('url', '')
+                            if url:
+                                crawl_results[url] = result
+                    except Exception as e:
+                        logger.error(f"❌ Batch {batch_num} crawl error: {e}")
+                
+                # Process records for this batch
+                batch_processed = []
+                batch_failed = 0
+                batch_broken = 0
+                
+                for url in batch_urls:
+                    try:
+                        record = record_by_url.get(url)
+                        if not record:
+                            continue
                         
-                except Exception as e:
-                    logger.error(f"❌ Error processing record {idx}: {e}")
-                    failed_count += 1
+                        tiktok_result = crawl_results.get(url)
+                        processed = self.process_lark_record(record, tiktok_result)
+                        
+                        if processed:
+                            batch_processed.append(processed)
+                            if processed.get('is_broken'):
+                                batch_broken += 1
+                            elif processed.get('status') != 'success':
+                                batch_failed += 1
+                        else:
+                            batch_failed += 1
+                    except Exception as e:
+                        logger.error(f"❌ Error processing record: {e}")
+                        batch_failed += 1
+                
+                # Write this batch to Sheets immediately (saves dates!)
+                if batch_processed:
+                    try:
+                        updated, inserted = self.sheets_client.batch_update_records(batch_processed)
+                        total_updated += updated
+                        total_inserted += inserted
+                        logger.info(f"✅ Batch {batch_num} saved: {updated} updated, {inserted} inserted")
+                    except Exception as e:
+                        logger.error(f"❌ Batch {batch_num} Sheets write error: {e}")
+                
+                all_processed.extend(batch_processed)
+                total_failed += batch_failed
+                total_broken += batch_broken
+                
+                logger.info(f"📊 Progress: {min(batch_start + len(batch_urls), total_to_crawl)}/{total_to_crawl} crawled, {len(all_processed)} processed, {total_failed} failed, {total_broken} broken")
             
-            logger.info(f"✅ Processed {len(processed_records)} records, {failed_count} failed, {broken_count} broken")
-            
-            # Step 5: Update/Insert into Google Sheets
-            logger.info("📊 Updating Google Sheets...")
-            updated, inserted = self.sheets_client.batch_update_records(processed_records)
-            
-            # Calculate success stats
-            success_count = sum(1 for r in processed_records if r.get('status') == 'success')
+            # Final summary
+            success_count = sum(1 for r in all_processed if r.get('status') == 'success')
             
             result = {
                 'success': True,
                 'message': 'Crawler v3.2 completed successfully',
                 'stats': {
                     'total': len(lark_records),
-                    'crawled': len(urls_to_crawl),
+                    'crawled': total_to_crawl,
                     'skipped_old': skipped_old,
-                    'processed': len(processed_records),
+                    'processed': len(all_processed),
                     'success': success_count,
-                    'updated': updated,
-                    'inserted': inserted,
-                    'failed': failed_count,
-                    'broken': broken_count
+                    'updated': total_updated,
+                    'inserted': total_inserted,
+                    'failed': total_failed,
+                    'broken': total_broken
                 }
             }
             
             logger.info(f"✅ Crawler v3.2 completed: {result['stats']}")
-            logger.info(f"📅 Summary: {len(urls_to_crawl)} recent crawled, {skipped_old} old skipped")
+            logger.info(f"📅 Summary: {total_to_crawl} recent crawled, {skipped_old} old skipped")
             return result
             
         except Exception as e:
