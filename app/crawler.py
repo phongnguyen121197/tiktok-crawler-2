@@ -1,6 +1,6 @@
 import logging
 from typing import List, Dict, Optional
-from datetime import datetime
+from datetime import datetime, date
 
 # Import Playwright crawler
 try:
@@ -184,6 +184,34 @@ class TikTokCrawler:
             logger.debug(f"Error extracting publish date: {e}")
             return None
     
+    def is_recent_video(self, publish_date_str: Optional[str]) -> bool:
+        """
+        Check if a video's publish date is within the crawl window.
+        Returns True if:
+        - publish_date is in current month or previous month
+        - publish_date is None/empty (unknown → needs crawl)
+        Returns False if publish_date is older than previous month.
+        
+        Example: If today is 2026-02-15, window = [2026-01-01, 2026-02-28]
+                 Videos from 2025-12 and earlier → skip
+        """
+        if not publish_date_str:
+            return True  # No date → treat as new, needs crawl
+        
+        try:
+            video_date = datetime.strptime(publish_date_str, '%Y-%m-%d').date()
+            today = date.today()
+            
+            # Calculate first day of previous month
+            if today.month == 1:
+                cutoff = date(today.year - 1, 12, 1)
+            else:
+                cutoff = date(today.year, today.month - 1, 1)
+            
+            return video_date >= cutoff
+        except (ValueError, TypeError):
+            return True  # Invalid date → treat as unknown, needs crawl
+    
     def process_lark_record(self, lark_record: Dict, tiktok_result: Dict = None) -> Optional[Dict]:
         """
         Process Lark record with TikTok crawl result
@@ -348,14 +376,35 @@ class TikTokCrawler:
             valid_dates_count = sum(1 for d in existing_dates.values() if d)
             logger.info(f"📅 Existing valid dates: {valid_dates_count}/{len(urls)}")
             
-            # Step 3: Batch crawl with Playwright
-            logger.info("🔄 Starting batch crawl with Playwright v3.2...")
+            # Step 2.5: Filter - only crawl recent videos (current & previous month)
+            all_urls = urls[:]  # Keep original list for reference
+            urls_to_crawl = []
+            skipped_old = 0
+            
+            for url in all_urls:
+                existing_date = existing_dates.get(url, '')
+                if self.is_recent_video(existing_date):
+                    urls_to_crawl.append(url)
+                else:
+                    skipped_old += 1
+            
+            if skipped_old > 0:
+                today = date.today()
+                if today.month == 1:
+                    cutoff_str = f"{today.year - 1}-12"
+                else:
+                    cutoff_str = f"{today.year}-{today.month - 1:02d}"
+                logger.info(f"📅 Date filter: crawling {len(urls_to_crawl)} recent videos (>= {cutoff_str}), skipping {skipped_old} old videos")
+            
+            # Step 3: Batch crawl with Playwright (only recent videos)
+            logger.info(f"🔄 Starting batch crawl with Playwright v3.2 ({len(urls_to_crawl)} videos)...")
             crawl_results = {}
             
             if self.use_playwright and self.playwright_crawler:
                 try:
                     # 📅 Pass existing_dates to crawler for priority handling
-                    results_list = self.playwright_crawler.crawl_batch_sync(urls, existing_dates=existing_dates)
+                    # Only crawl recent videos (urls_to_crawl), not all urls
+                    results_list = self.playwright_crawler.crawl_batch_sync(urls_to_crawl, existing_dates=existing_dates)
                     
                     # Map results by URL
                     for result in results_list:
@@ -366,15 +415,15 @@ class TikTokCrawler:
                 except Exception as e:
                     logger.error(f"❌ Batch crawl error: {e}")
             
-            # Step 4: Process each record with crawl results
-            logger.info("🔄 Processing records with crawl results...")
+            # Step 4: Process only recent records with crawl results (skip old videos)
+            logger.info("🔄 Processing recent records with crawl results...")
             processed_records = []
             failed_count = 0
             broken_count = 0
             
-            for idx, url in enumerate(urls, 1):
+            for idx, url in enumerate(urls_to_crawl, 1):
                 if idx % 50 == 0:
-                    logger.info(f"Processing records: {idx}/{len(urls)}")
+                    logger.info(f"Processing records: {idx}/{len(urls_to_crawl)}")
                 
                 try:
                     record = record_by_url.get(url)
@@ -411,6 +460,8 @@ class TikTokCrawler:
                 'message': 'Crawler v3.2 completed successfully',
                 'stats': {
                     'total': len(lark_records),
+                    'crawled': len(urls_to_crawl),
+                    'skipped_old': skipped_old,
                     'processed': len(processed_records),
                     'success': success_count,
                     'updated': updated,
@@ -421,6 +472,7 @@ class TikTokCrawler:
             }
             
             logger.info(f"✅ Crawler v3.2 completed: {result['stats']}")
+            logger.info(f"📅 Summary: {len(urls_to_crawl)} recent crawled, {skipped_old} old skipped")
             return result
             
         except Exception as e:
@@ -472,18 +524,32 @@ class TikTokCrawler:
                 existing_dates[link_value] = existing_date or ''
                 record_by_url[link_value] = record
             
-            # Batch crawl
+            # Filter: only crawl recent videos (current & previous month)
+            urls_to_crawl = []
+            skipped_old = 0
+            
+            for url in urls:
+                existing_date = existing_dates.get(url, '')
+                if self.is_recent_video(existing_date):
+                    urls_to_crawl.append(url)
+                else:
+                    skipped_old += 1
+            
+            if skipped_old > 0:
+                logger.info(f"📅 Date filter: crawling {len(urls_to_crawl)} recent, skipping {skipped_old} old videos")
+            
+            # Batch crawl (only recent videos)
             crawl_results = {}
             if self.use_playwright and self.playwright_crawler:
-                results_list = self.playwright_crawler.crawl_batch_sync(urls, existing_dates=existing_dates)
+                results_list = self.playwright_crawler.crawl_batch_sync(urls_to_crawl, existing_dates=existing_dates)
                 for result in results_list:
                     url = result.get('url', '')
                     if url:
                         crawl_results[url] = result
             
-            # Process results
+            # Process results (only recent videos)
             processed_records = []
-            for url in urls:
+            for url in urls_to_crawl:
                 record = record_by_url.get(url)
                 if not record:
                     continue
@@ -501,6 +567,8 @@ class TikTokCrawler:
                 'message': 'Batch crawl v3.2 completed',
                 'stats': {
                     'total': len(lark_records),
+                    'crawled': len(urls_to_crawl),
+                    'skipped_old': skipped_old,
                     'processed': len(processed_records),
                     'updated': updated,
                     'inserted': inserted
