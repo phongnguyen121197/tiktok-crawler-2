@@ -372,11 +372,28 @@ class TikTokCrawler:
                 existing_dates[link_value] = existing_date or ''
                 record_by_url[link_value] = record
             
-            # Log existing dates stats
-            valid_dates_count = sum(1 for d in existing_dates.values() if d)
-            logger.info(f"📅 Existing valid dates: {valid_dates_count}/{len(urls)}")
+            # Log existing dates stats from Lark
+            valid_dates_lark = sum(1 for d in existing_dates.values() if d)
+            logger.info(f"📅 Existing valid dates from Lark: {valid_dates_lark}/{len(urls)}")
             
-            # Step 2.5: Filter - only crawl recent videos (current & previous month)
+            # Step 2.5: Merge dates from Google Sheets (where crawled dates are actually stored)
+            # Lark may not have Published Date, but Sheets does from previous crawl runs
+            try:
+                sheets_dates = self.sheets_client.get_publish_dates_by_link()
+                merged_count = 0
+                for url in urls:
+                    if not existing_dates.get(url) and url in sheets_dates:
+                        existing_dates[url] = sheets_dates[url]
+                        merged_count += 1
+                if merged_count > 0:
+                    logger.info(f"📅 Merged {merged_count} dates from Google Sheets")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not read dates from Sheets: {e}")
+            
+            valid_dates_total = sum(1 for d in existing_dates.values() if d)
+            logger.info(f"📅 Total valid dates (Lark + Sheets): {valid_dates_total}/{len(urls)}")
+            
+            # Step 3: Filter - only crawl recent videos (current & previous month)
             all_urls = urls[:]  # Keep original list for reference
             urls_to_crawl = []
             skipped_old = 0
@@ -523,6 +540,15 @@ class TikTokCrawler:
                 urls.append(link_value)
                 existing_dates[link_value] = existing_date or ''
                 record_by_url[link_value] = record
+            
+            # Merge dates from Google Sheets (where crawled dates are actually stored)
+            try:
+                sheets_dates = self.sheets_client.get_publish_dates_by_link()
+                for url in urls:
+                    if not existing_dates.get(url) and url in sheets_dates:
+                        existing_dates[url] = sheets_dates[url]
+            except Exception as e:
+                logger.warning(f"⚠️ Could not read dates from Sheets: {e}")
             
             # Filter: only crawl recent videos (current & previous month)
             urls_to_crawl = []

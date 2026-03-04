@@ -80,6 +80,40 @@ class GoogleSheetsClient:
             logger.error(f"❌ Error getting records index: {e}")
             return {}
     
+    def get_publish_dates_by_link(self) -> Dict[str, str]:
+        """
+        Read existing Published Date values from Google Sheets, keyed by link URL.
+        
+        Columns: A=Record ID | B=Link TikTok | C=Views | D=Baseline | E=Published Date
+        
+        Returns:
+            Dict {link_url: publish_date_str} for rows that have a valid date in column E
+        """
+        try:
+            all_values = self.worksheet.get_all_values()
+            
+            if not all_values or len(all_values) < 2:
+                return {}
+            
+            link_col = 1           # Column B - Link TikTok
+            publish_date_col = 4   # Column E - Published Date
+            
+            dates_by_link = {}
+            for row in all_values[1:]:  # Skip header
+                if len(row) > publish_date_col:
+                    link = row[link_col].strip() if row[link_col] else ''
+                    pub_date = row[publish_date_col].strip() if row[publish_date_col] else ''
+                    
+                    if link and pub_date:
+                        dates_by_link[link] = pub_date
+            
+            logger.info(f"📅 Sheets: found {len(dates_by_link)} links with Published Date")
+            return dates_by_link
+            
+        except Exception as e:
+            logger.error(f"❌ Error reading publish dates from Sheets: {e}")
+            return {}
+    
     def batch_update_records(self, records: List[Dict]) -> tuple:
         """
         Update or insert records with deduplication and broken link handling
