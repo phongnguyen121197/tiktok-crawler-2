@@ -371,6 +371,134 @@ class GoogleSheetsClient:
         logger.info(f"✅ Inserted {inserted_count}/{len(to_insert)} records successfully")
         return inserted_count
     
+    # ─────────────────────────────────────────────────────────────────────────
+    # PENDING RETRY QUEUE
+    # Stored in a separate sheet tab named "Pending Retry".
+    # Columns: URL | RecordID | QueuedAt | Attempts
+    # ─────────────────────────────────────────────────────────────────────────
+
+    _PENDING_SHEET_NAME = "Pending Retry"
+    _PENDING_HEADERS = ["URL", "RecordID", "QueuedAt", "Attempts"]
+
+    def _get_or_create_pending_worksheet(self):
+        """Return the 'Pending Retry' worksheet, creating it if needed."""
+        try:
+            return self.spreadsheet.worksheet(self._PENDING_SHEET_NAME)
+        except Exception:
+            ws = self.spreadsheet.add_worksheet(
+                title=self._PENDING_SHEET_NAME, rows=1000, cols=4
+            )
+            ws.append_row(self._PENDING_HEADERS, value_input_option='USER_ENTERED')
+            logger.info(f"📋 Created '{self._PENDING_SHEET_NAME}' worksheet")
+            return ws
+
+    def save_pending_retry(self, items: List[Dict]) -> None:
+        """
+        Add new pending items to the retry queue (skip duplicates).
+
+        Args:
+            items: list of {'url': str, 'record_id': str}
+        """
+        if not items:
+            return
+        try:
+            ws = self._get_or_create_pending_worksheet()
+            all_values = ws.get_all_values()
+            existing_urls = {row[0] for row in all_values[1:] if row} if len(all_values) > 1 else set()
+
+            now = datetime.now().isoformat()
+            new_rows = []
+            for item in items:
+                url = item.get('url', '')
+                if url and url not in existing_urls:
+                    new_rows.append([url, item.get('record_id', ''), now, 1])
+                    existing_urls.add(url)
+
+            if new_rows:
+                ws.append_rows(new_rows, value_input_option='USER_ENTERED')
+                logger.info(f"⏳ Saved {len(new_rows)} new pending URLs to retry queue")
+        except Exception as e:
+            logger.error(f"❌ Error saving pending retry queue: {e}")
+
+    def get_pending_retry(self) -> List[Dict]:
+        """
+        Return all items currently in the retry queue.
+
+        Returns:
+            list of {'url', 'record_id', 'queued_at', 'attempts'}
+        """
+        try:
+            ws = self._get_or_create_pending_worksheet()
+            all_values = ws.get_all_values()
+
+            if len(all_values) < 2:
+                return []
+
+            result = []
+            for row in all_values[1:]:
+                if not row or not row[0]:
+                    continue
+                result.append({
+                    'url': row[0],
+                    'record_id': row[1] if len(row) > 1 else '',
+                    'queued_at': row[2] if len(row) > 2 else '',
+                    'attempts': int(row[3]) if len(row) > 3 and row[3].isdigit() else 1,
+                })
+            return result
+        except Exception as e:
+            logger.error(f"❌ Error reading pending retry queue: {e}")
+            return []
+
+    def update_pending_retry(self, remove_urls: List[str], update_items: List[Dict]) -> None:
+        """
+        Remove resolved URLs and update attempt counts for still-pending items.
+
+        Args:
+            remove_urls: URLs to remove from the queue
+            update_items: items to update (with new 'attempts' count)
+        """
+        if not remove_urls and not update_items:
+            return
+        try:
+            ws = self._get_or_create_pending_worksheet()
+            all_values = ws.get_all_values()
+
+            if len(all_values) < 2:
+                return
+
+            remove_set = set(remove_urls)
+            update_map = {item['url']: item for item in update_items}
+
+            # Rebuild sheet: header + rows that are not removed
+            new_rows = [all_values[0]]  # keep header
+            for row in all_values[1:]:
+                if not row or not row[0]:
+                    continue
+                url = row[0]
+                if url in remove_set:
+                    continue  # drop this row
+                if url in update_map:
+                    item = update_map[url]
+                    new_rows.append([
+                        url,
+                        item.get('record_id', row[1] if len(row) > 1 else ''),
+                        row[2] if len(row) > 2 else '',
+                        str(item.get('attempts', 1)),
+                    ])
+                else:
+                    new_rows.append(row)
+
+            ws.clear()
+            if new_rows:
+                ws.update('A1', new_rows, value_input_option='USER_ENTERED')
+
+            logger.info(
+                f"⏳ Pending queue updated: removed {len(remove_urls)}, "
+                f"kept/updated {len(new_rows) - 1}"
+            )
+        except Exception as e:
+            logger.error(f"❌ Error updating pending retry queue: {e}")
+
     def _remove_duplicates(self):
         """Remove duplicate records based on Record ID (keep first occurrence)"""
         try:

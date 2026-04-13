@@ -192,6 +192,118 @@ class LarkClient:
             logger.error(f"❌ Error getting records: {e}")
             return []
     
+    # ─────────────────────────────────────────────────────────────────────────
+    # WRITE BACK TO BITABLE
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _date_str_to_ms(self, date_str: str):
+        """Convert 'YYYY-MM-DD' to Unix timestamp in milliseconds (UTC midnight)."""
+        try:
+            from datetime import datetime
+            dt = datetime.strptime(str(date_str).strip(), '%Y-%m-%d')
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            return None
+
+    def batch_update_records(self, records: list) -> tuple:
+        """
+        Batch update records in Lark Bitable with crawled view stats.
+
+        Updates these fields (matching the Bitable column names in the screenshot):
+            Lượt xem hiện tại  - new crawled view count
+            Số view 24h trước  - previous view count (for delta tracking)
+            Published Date     - video publish date (only when newly discovered)
+            Lần kiểm tra cuối  - timestamp of this crawl run
+            Status             - success / partial / broken
+
+        Args:
+            records: list of processed record dicts (from process_lark_record)
+        Returns:
+            (updated_count, failed_count)
+        """
+        if not records:
+            return (0, 0)
+
+        LARK_BATCH_SIZE = 500   # Lark API hard limit per request
+        updated_total = 0
+        failed_total = 0
+        now_ms = int(time.time() * 1000)
+
+        url = (
+            f"https://open.larksuite.com/open-apis/bitable/v1/apps/"
+            f"{self.bitable_app_token}/tables/{self.table_id}/records/batch_update"
+        )
+
+        for i in range(0, len(records), LARK_BATCH_SIZE):
+            batch = records[i:i + LARK_BATCH_SIZE]
+            update_records = []
+
+            for record in batch:
+                record_id = record.get('record_id', '')
+                if not record_id:
+                    continue
+
+                is_broken = record.get('is_broken', False)
+                fields = {
+                    'Lần kiểm tra cuối': now_ms,
+                    'Status': 'broken' if is_broken else record.get('status', 'partial'),
+                }
+
+                if not is_broken:
+                    views = record.get('views')
+                    baseline = record.get('baseline')
+                    publish_date = record.get('publish_date')
+
+                    if views is not None:
+                        fields['Lượt xem hiện tại'] = int(views)
+                    if baseline is not None:
+                        fields['Số view 24h trước'] = int(baseline)
+                    if publish_date:
+                        date_ms = self._date_str_to_ms(publish_date)
+                        if date_ms:
+                            fields['Published Date'] = date_ms
+
+                update_records.append({'record_id': record_id, 'fields': fields})
+
+            if not update_records:
+                continue
+
+            try:
+                response = self._make_request(
+                    'POST', url,
+                    json={'records': update_records},
+                    timeout=30,
+                )
+
+                if not response:
+                    failed_total += len(update_records)
+                    continue
+
+                data = response.json()
+                if data.get('code') == 0:
+                    updated_records = data.get('data', {}).get('records', [])
+                    updated_total += len(updated_records)
+                    logger.info(
+                        f"✅ Lark: updated {len(updated_records)}/{len(update_records)} records"
+                    )
+                else:
+                    logger.error(
+                        f"❌ Lark batch_update error "
+                        f"(code={data.get('code')}): {data.get('msg', '')}"
+                    )
+                    failed_total += len(update_records)
+
+            except Exception as e:
+                logger.error(f"❌ Lark batch_update exception: {e}")
+                failed_total += len(update_records)
+
+            # Brief pause between large batches to respect rate limits
+            if i + LARK_BATCH_SIZE < len(records):
+                time.sleep(0.5)
+
+        logger.info(f"📊 Lark write done: {updated_total} updated, {failed_total} failed")
+        return (updated_total, failed_total)
+
     def get_record(self, record_id):
         """Get single record by ID"""
         url = f"https://open.larksuite.com/open-apis/bitable/v1/apps/{self.bitable_app_token}/tables/{self.table_id}/records/{record_id}"

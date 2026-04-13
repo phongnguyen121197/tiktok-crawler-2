@@ -12,6 +12,13 @@ from app.crawler import TikTokCrawler
 from app.lark_client import LarkClient
 from app.sheets_client import GoogleSheetsClient
 
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    SCHEDULER_AVAILABLE = True
+except ImportError:
+    SCHEDULER_AVAILABLE = False
+    logging.warning("⚠️ APScheduler not installed. Auto-schedule disabled. Run: pip install apscheduler")
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -21,6 +28,7 @@ app = FastAPI(title="TikTok View Crawler")
 lark_client = None
 sheets_client = None
 crawler = None
+scheduler = None
 
 def init_clients():
     """Initialize all clients at startup"""
@@ -74,24 +82,104 @@ def init_clients():
         logger.error(f"❌ Failed to initialize crawler: {e}")
         crawler = None
 
+def _start_scheduler():
+    """Start APScheduler with daily 8:00 AM Vietnam time job."""
+    global scheduler
+    if not SCHEDULER_AVAILABLE:
+        logger.warning("⚠️ APScheduler not available — scheduled job skipped")
+        return
+
+    try:
+        # Asia/Ho_Chi_Minh = UTC+7. If tzdata is not available on the server,
+        # we fall back to UTC offset (01:00 UTC = 08:00 VN time).
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo('Asia/Ho_Chi_Minh')
+            hour_utc, tz_label = 8, 'Asia/Ho_Chi_Minh'
+        except Exception:
+            tz = 'UTC'
+            hour_utc, tz_label = 1, 'UTC (= 08:00 VN)'
+
+        scheduler = BackgroundScheduler(timezone=tz)
+
+        # Daily crawl at 08:00
+        scheduler.add_job(
+            run_daily_crawl,
+            'cron',
+            hour=hour_utc,
+            minute=0,
+            id='daily_crawl',
+            name='Daily TikTok View Crawl',
+            replace_existing=True,
+            misfire_grace_time=3600,   # Allow up to 1h late start (e.g. cold boot)
+        )
+
+        # Retry-pending at 14:00 (6 hours after daily crawl)
+        scheduler.add_job(
+            _run_retry_pending,
+            'cron',
+            hour=(hour_utc + 6) % 24,
+            minute=0,
+            id='retry_pending',
+            name='Retry Pending Videos',
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+
+        scheduler.start()
+
+        jobs = scheduler.get_jobs()
+        for job in jobs:
+            next_run = job.next_run_time.strftime('%Y-%m-%d %H:%M') if job.next_run_time else 'N/A'
+            logger.info(f"⏰ Scheduled: [{job.name}] next run = {next_run} {tz_label}")
+
+    except Exception as e:
+        logger.error(f"❌ Failed to start scheduler: {e}", exc_info=True)
+
+
+def _run_retry_pending():
+    """Background wrapper for retry-pending job."""
+    if not crawler:
+        logger.warning("⚠️ Retry-pending: crawler not ready, skipping")
+        return
+    try:
+        logger.info("🔄 Scheduled retry-pending job starting...")
+        result = crawler.crawl_pending_retry()
+        logger.info(f"✅ Retry-pending done: {result}")
+    except Exception as e:
+        logger.error(f"❌ Retry-pending job failed: {e}", exc_info=True)
+
+
 @app.on_event("startup")
 async def startup_event():
-    """Initialize clients on startup"""
+    """Initialize clients on startup, then start scheduler."""
     logger.info("🚀 Application starting up...")
     init_clients()
+    _start_scheduler()
     logger.info("✅ Application ready")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Gracefully shut down scheduler."""
+    global scheduler
+    if scheduler and scheduler.running:
+        scheduler.shutdown(wait=False)
+        logger.info("⏰ Scheduler stopped")
 
 @app.get("/")
 async def root():
     return {
-        "message": "TikTok View Crawler API", 
-        "version": "2.3.0",
-        "mode": "Playwright + Google Sheets + Lark Bitable + Deduplication",
+        "message": "TikTok View Crawler API",
+        "version": "4.0.0",
+        "mode": "yt-dlp (primary) + Playwright fallback + Pending retry queue",
         "features": [
-            "Direct TikTok scraping via Playwright",
-            "Automatic fallback to Lark data",
+            "yt-dlp parallel crawl via TikTok mobile API (3 workers, ~3-5s/video)",
+            "Playwright fallback with fast-fail for yt-dlp misses",
+            "Pending propagation detection for very new videos",
+            "Retry queue: /jobs/retry-pending (run 6h after daily)",
+            "Google Sheets + Lark Bitable integration",
             "Duplicate prevention",
-            "Background job processing"
         ]
     }
 
@@ -289,6 +377,52 @@ async def global_exception_handler(request, exc):
     )
 
 # Additional helper endpoint for debugging
+@app.get("/schedule/status")
+async def schedule_status():
+    """Show scheduled jobs and their next run times."""
+    if not scheduler or not scheduler.running:
+        return {"status": "scheduler_not_running", "jobs": []}
+
+    jobs = []
+    for job in scheduler.get_jobs():
+        next_run = job.next_run_time.isoformat() if job.next_run_time else None
+        jobs.append({
+            "id": job.id,
+            "name": job.name,
+            "next_run": next_run,
+        })
+    return {"status": "running", "jobs": jobs, "timezone": "Asia/Ho_Chi_Minh (08:00 daily)"}
+
+
+@app.post("/jobs/retry-pending")
+async def retry_pending_job(background_tasks: BackgroundTasks):
+    """
+    Retry videos that were pending data propagation during the last daily crawl.
+    Run this 6+ hours after /jobs/daily to catch newly-uploaded April videos
+    whose TikTok SSR data was not yet available at crawl time.
+    """
+    if not crawler:
+        raise HTTPException(status_code=500, detail="Crawler not initialized")
+
+    def run_retry():
+        try:
+            logger.info("🔄 Starting pending retry job (background)...")
+            result = crawler.crawl_pending_retry()
+            logger.info(f"✅ Pending retry completed: {result}")
+        except Exception as e:
+            logger.error(f"❌ Pending retry failed: {e}", exc_info=True)
+
+    background_tasks.add_task(run_retry)
+    logger.info("🔄 Pending retry job started in background")
+    return {
+        "success": True,
+        "status": "started",
+        "message": "Pending retry job started in background",
+        "note": "Retries videos that had no data during last daily crawl (new videos)",
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
 @app.get("/debug/info")
 async def debug_info():
     """

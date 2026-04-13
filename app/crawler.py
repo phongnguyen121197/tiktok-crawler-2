@@ -10,42 +10,69 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
     logging.warning("⚠️ Playwright not available, will use Lark data fallback only")
 
+# Import yt-dlp crawler (optional but strongly recommended)
+try:
+    from app.ytdlp_crawler import YtDlpCrawler
+    YTDLP_AVAILABLE = True
+except ImportError:
+    YTDLP_AVAILABLE = False
+    logging.warning("⚠️ yt-dlp not available. Install with: pip install yt-dlp")
+
 logger = logging.getLogger(__name__)
 
 class TikTokCrawler:
     """
-    TikTok Crawler v3.2 with Playwright integration
-    NOW WITH PUBLISH DATE PRIORITY! 📅
-    - Preserves existing publish_date if already set
-    - Clears data for broken/unavailable links
+    TikTok Crawler v4.0 with yt-dlp (primary) + Playwright (fallback)
+    - yt-dlp: parallel crawl via TikTok mobile API, ~3-5s/video, 3 workers
+    - Playwright: fallback for yt-dlp failures, with fast-fail for new videos
+    - pending_propagation: new videos skipped + queued for retry after 6h
+    - Broken link detection no longer clears data on transient failures
     """
-    
+
     def __init__(self, lark_client, sheets_client, use_playwright=True):
         """
-        Initialize crawler with Lark and Sheets clients
-        
+        Initialize crawler with Lark and Sheets clients.
+
         Args:
             lark_client: LarkClient instance
             sheets_client: GoogleSheetsClient instance
-            use_playwright: Use Playwright for scraping (default: True)
+            use_playwright: Use Playwright as fallback (default: True)
         """
         self.lark_client = lark_client
         self.sheets_client = sheets_client
         self.use_playwright = use_playwright and PLAYWRIGHT_AVAILABLE
-        
-        # Initialize Playwright crawler if available
+
+        # yt-dlp crawler (primary)
+        if YTDLP_AVAILABLE:
+            try:
+                self.ytdlp_crawler = YtDlpCrawler(max_workers=3)
+                logger.info("✅ yt-dlp crawler initialized (primary)")
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize yt-dlp: {e}")
+                self.ytdlp_crawler = None
+        else:
+            self.ytdlp_crawler = None
+
+        # Playwright crawler (fallback)
         if self.use_playwright:
             try:
                 self.playwright_crawler = TikTokPlaywrightCrawler()
-                logger.info("✅ Playwright crawler v3.2 initialized")
+                logger.info("✅ Playwright crawler v3.2 initialized (fallback)")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize Playwright: {e}")
                 self.playwright_crawler = None
                 self.use_playwright = False
         else:
             self.playwright_crawler = None
-        
-        logger.info(f"🔧 Crawler mode: {'Playwright v3.2' if self.use_playwright else 'Lark fallback only'}")
+
+        mode_parts = []
+        if self.ytdlp_crawler:
+            mode_parts.append("yt-dlp (primary)")
+        if self.use_playwright:
+            mode_parts.append("Playwright (fallback)")
+        if not mode_parts:
+            mode_parts.append("Lark data only")
+        logger.info(f"🔧 Crawler mode: {' + '.join(mode_parts)}")
         
     def extract_video_id_from_url(self, url: str) -> Optional[str]:
         """Extract TikTok video ID from URL"""
@@ -250,16 +277,21 @@ class TikTokCrawler:
             
             # Use provided TikTok result or fallback to Lark data
             if tiktok_result:
-                # v3.2: Check if broken link
+                # ── pending_propagation: very new video, data not ready yet ──
+                # Skip writing to sheets — caller will queue for retry.
+                if tiktok_result.get('pending_propagation'):
+                    logger.info(f"⏳ Pending propagation (skip write): {link_value[:50]}...")
+                    return None  # Caller skips this record entirely
+
+                # ── broken link: video deleted/private ──
                 if tiktok_result.get('is_broken'):
-                    # Broken link - clear all data
                     logger.warning(f"🔗 Broken link detected: {link_value[:50]}...")
                     return {
                         'record_id': record_id,
                         'link': link_value,
-                        'views': None,  # Will be handled by sheets_client
+                        'views': None,
                         'baseline': None,
-                        'publish_date': None,  # Clear date for broken link
+                        'publish_date': None,
                         'status': 'broken',
                         'is_broken': True,
                         'source_data': {
@@ -270,17 +302,14 @@ class TikTokCrawler:
                             'error': tiktok_result.get('error', '')
                         }
                     }
-                
+
                 if tiktok_result.get('success') and tiktok_result.get('views', 0) > 0:
                     # Success - use crawled data
                     current_views = tiktok_result.get('views', views_lark or 0)
-                    
-                    # v3.2: Publish date from crawler already handles priority
                     publish_date = tiktok_result.get('publish_date') or publish_date_from_lark
-                    
                     status = 'success'
                 else:
-                    # Failed but not broken - use Lark fallback, preserve date
+                    # Failed but not broken - preserve Lark data
                     current_views = views_lark or 0
                     publish_date = publish_date_from_lark
                     status = 'partial'
@@ -290,8 +319,9 @@ class TikTokCrawler:
                 publish_date = publish_date_from_lark
                 status = 'partial'
             
-            # Use Lark baseline
-            baseline = baseline_value if baseline_value else (views_lark or 0)
+            # "Số view 24h trước" = old "Lượt xem hiện tại" before this crawl.
+            # This allows the dashboard to compute the daily view delta correctly.
+            baseline = views_lark or 0
             
             processed_record = {
                 'record_id': record_id,
@@ -413,52 +443,96 @@ class TikTokCrawler:
                     cutoff_str = f"{today.year}-{today.month - 1:02d}"
                 logger.info(f"📅 Date filter: crawling {len(urls_to_crawl)} recent videos (>= {cutoff_str}), skipping {skipped_old} old videos")
             
-            # Step 4: Batch crawl with Playwright + incremental Sheets write
-            # Process in batches of INCREMENTAL_BATCH_SIZE to save dates progressively
-            # If process is killed mid-run, dates from completed batches are already saved
+            # Step 4: Crawl with yt-dlp (primary) + Playwright fallback
+            # Process in batches of INCREMENTAL_BATCH_SIZE so dates are saved
+            # progressively — if killed mid-run, completed batches are persisted.
             INCREMENTAL_BATCH_SIZE = 100
             total_to_crawl = len(urls_to_crawl)
-            logger.info(f"🔄 Starting incremental batch crawl v3.2 ({total_to_crawl} videos, batch size {INCREMENTAL_BATCH_SIZE})...")
-            
+            logger.info(
+                f"🔄 Starting incremental batch crawl v4.0 "
+                f"({total_to_crawl} videos, batch size {INCREMENTAL_BATCH_SIZE})..."
+            )
+
             all_processed = []
             total_updated = 0
-            total_inserted = 0
             total_failed = 0
             total_broken = 0
-            
+            total_pending = 0
+            all_pending_urls = []  # URLs to retry later (data not propagated yet)
+
             for batch_start in range(0, total_to_crawl, INCREMENTAL_BATCH_SIZE):
                 batch_urls = urls_to_crawl[batch_start:batch_start + INCREMENTAL_BATCH_SIZE]
                 batch_num = batch_start // INCREMENTAL_BATCH_SIZE + 1
                 total_batches = (total_to_crawl + INCREMENTAL_BATCH_SIZE - 1) // INCREMENTAL_BATCH_SIZE
-                
-                logger.info(f"📦 Batch {batch_num}/{total_batches}: crawling {len(batch_urls)} videos (total progress: {batch_start}/{total_to_crawl})...")
-                
-                # Crawl this batch
+
+                logger.info(
+                    f"📦 Batch {batch_num}/{total_batches}: "
+                    f"{len(batch_urls)} videos (progress: {batch_start}/{total_to_crawl})..."
+                )
+
+                # ── Phase 1: yt-dlp (parallel, fast) ──────────────────────────
                 crawl_results = {}
-                if self.use_playwright and self.playwright_crawler:
+                playwright_fallback_urls = []
+
+                if self.ytdlp_crawler:
                     try:
-                        results_list = self.playwright_crawler.crawl_batch_sync(batch_urls, existing_dates=existing_dates)
-                        for result in results_list:
-                            url = result.get('url', '')
-                            if url:
-                                crawl_results[url] = result
+                        ytdlp_list = self.ytdlp_crawler.crawl_batch(batch_urls)
+                        for r in ytdlp_list:
+                            url_r = r.get('url', '')
+                            if not url_r:
+                                continue
+                            if r.get('success'):
+                                crawl_results[url_r] = r
+                            elif r.get('pending_propagation') or r.get('is_broken'):
+                                # pending / broken → keep as-is, no Playwright needed
+                                crawl_results[url_r] = r
+                            else:
+                                # Transient yt-dlp failure → fallback to Playwright
+                                playwright_fallback_urls.append(url_r)
                     except Exception as e:
-                        logger.error(f"❌ Batch {batch_num} crawl error: {e}")
-                
-                # Process records for this batch
+                        logger.error(f"❌ yt-dlp batch {batch_num} error: {e}")
+                        playwright_fallback_urls = batch_urls  # fall back all
+                else:
+                    playwright_fallback_urls = batch_urls
+
+                # ── Phase 2: Playwright fallback (sequential, for yt-dlp misses) ──
+                if playwright_fallback_urls and self.use_playwright and self.playwright_crawler:
+                    logger.info(
+                        f"🎭 Playwright fallback: {len(playwright_fallback_urls)} URLs..."
+                    )
+                    try:
+                        pw_list = self.playwright_crawler.crawl_batch_sync(
+                            playwright_fallback_urls,
+                            existing_dates=existing_dates,
+                        )
+                        for r in pw_list:
+                            url_r = r.get('url', '')
+                            if url_r:
+                                crawl_results[url_r] = r
+                    except Exception as e:
+                        logger.error(f"❌ Playwright batch {batch_num} error: {e}")
+
+                # ── Process results ────────────────────────────────────────────
                 batch_processed = []
+                batch_pending_urls = []
                 batch_failed = 0
                 batch_broken = 0
-                
+
                 for url in batch_urls:
                     try:
                         record = record_by_url.get(url)
                         if not record:
                             continue
-                        
+
                         tiktok_result = crawl_results.get(url)
+
+                        # pending_propagation → queue for retry, skip Sheets write
+                        if tiktok_result and tiktok_result.get('pending_propagation'):
+                            batch_pending_urls.append(url)
+                            continue
+
                         processed = self.process_lark_record(record, tiktok_result)
-                        
+
                         if processed:
                             batch_processed.append(processed)
                             if processed.get('is_broken'):
@@ -470,44 +544,70 @@ class TikTokCrawler:
                     except Exception as e:
                         logger.error(f"❌ Error processing record: {e}")
                         batch_failed += 1
-                
-                # Write this batch to Sheets immediately (saves dates!)
+
+                # ── Write batch to Lark Bitable ───────────────────────────────
                 if batch_processed:
                     try:
-                        updated, inserted = self.sheets_client.batch_update_records(batch_processed)
+                        updated, failed = self.lark_client.batch_update_records(batch_processed)
                         total_updated += updated
-                        total_inserted += inserted
-                        logger.info(f"✅ Batch {batch_num} saved: {updated} updated, {inserted} inserted")
+                        if failed:
+                            logger.warning(f"⚠️ Batch {batch_num}: {failed} records failed Lark write")
+                        logger.info(f"✅ Batch {batch_num} → Lark: {updated} updated")
                     except Exception as e:
-                        logger.error(f"❌ Batch {batch_num} Sheets write error: {e}")
-                
+                        logger.error(f"❌ Batch {batch_num} Lark write error: {e}")
+
+                # ── Save pending URLs to retry queue ──────────────────────────
+                if batch_pending_urls:
+                    try:
+                        pending_records = []
+                        for url in batch_pending_urls:
+                            record = record_by_url.get(url)
+                            if record:
+                                pending_records.append({
+                                    'url': url,
+                                    'record_id': record.get('id', ''),
+                                })
+                        self.sheets_client.save_pending_retry(pending_records)
+                        logger.info(f"⏳ Queued {len(batch_pending_urls)} pending URLs for retry")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not save pending queue: {e}")
+
                 all_processed.extend(batch_processed)
+                all_pending_urls.extend(batch_pending_urls)
                 total_failed += batch_failed
                 total_broken += batch_broken
-                
-                logger.info(f"📊 Progress: {min(batch_start + len(batch_urls), total_to_crawl)}/{total_to_crawl} crawled, {len(all_processed)} processed, {total_failed} failed, {total_broken} broken")
+                total_pending += len(batch_pending_urls)
+
+                logger.info(
+                    f"📊 Progress: {min(batch_start + len(batch_urls), total_to_crawl)}/{total_to_crawl} "
+                    f"| processed={len(all_processed)} failed={total_failed} "
+                    f"broken={total_broken} pending={total_pending}"
+                )
             
             # Final summary
             success_count = sum(1 for r in all_processed if r.get('status') == 'success')
             
             result = {
                 'success': True,
-                'message': 'Crawler v3.2 completed successfully',
+                'message': 'Crawler v4.0 completed successfully',
                 'stats': {
                     'total': len(lark_records),
                     'crawled': total_to_crawl,
                     'skipped_old': skipped_old,
                     'processed': len(all_processed),
                     'success': success_count,
-                    'updated': total_updated,
-                    'inserted': total_inserted,
+                    'lark_updated': total_updated,
                     'failed': total_failed,
-                    'broken': total_broken
+                    'broken': total_broken,
+                    'pending_retry': total_pending,
                 }
             }
-            
-            logger.info(f"✅ Crawler v3.2 completed: {result['stats']}")
-            logger.info(f"📅 Summary: {total_to_crawl} recent crawled, {skipped_old} old skipped")
+
+            logger.info(f"✅ Crawler v4.0 completed: {result['stats']}")
+            logger.info(
+                f"📅 Summary: {total_to_crawl} recent crawled, "
+                f"{skipped_old} old skipped, {total_pending} queued for retry"
+            )
             return result
             
         except Exception as e:
@@ -629,6 +729,135 @@ class TikTokCrawler:
                 }
             }
     
+    def crawl_pending_retry(self) -> Dict:
+        """
+        Retry videos that were marked as pending_propagation in previous runs.
+        Should be called 6+ hours after the main daily crawl.
+
+        Flow:
+            1. Read pending URLs from Sheets "Pending Retry" tab
+            2. Try yt-dlp first (parallel), then Playwright for misses
+            3. On success: write to main sheet + remove from pending
+            4. On failure: increment attempt count; drop after 3 attempts
+        """
+        try:
+            logger.info("🔄 Starting pending retry crawl...")
+
+            pending_items = self.sheets_client.get_pending_retry()
+            if not pending_items:
+                logger.info("✅ No pending URLs to retry")
+                return {'success': True, 'message': 'No pending URLs', 'stats': {'retried': 0, 'resolved': 0}}
+
+            logger.info(f"⏳ Found {len(pending_items)} pending URLs to retry")
+
+            urls = [item['url'] for item in pending_items]
+            url_to_item = {item['url']: item for item in pending_items}
+
+            # Build existing_dates from Sheets for date preservation
+            try:
+                existing_dates = self.sheets_client.get_publish_dates_by_link()
+            except Exception:
+                existing_dates = {}
+
+            # ── Phase 1: yt-dlp ──────────────────────────────────────────────
+            crawl_results = {}
+            playwright_fallback_urls = []
+
+            if self.ytdlp_crawler:
+                try:
+                    ytdlp_list = self.ytdlp_crawler.crawl_batch(urls)
+                    for r in ytdlp_list:
+                        url_r = r.get('url', '')
+                        if not url_r:
+                            continue
+                        if r.get('success') or r.get('is_broken'):
+                            crawl_results[url_r] = r
+                        elif r.get('pending_propagation'):
+                            crawl_results[url_r] = r  # still pending
+                        else:
+                            playwright_fallback_urls.append(url_r)
+                except Exception as e:
+                    logger.error(f"❌ yt-dlp retry error: {e}")
+                    playwright_fallback_urls = urls
+            else:
+                playwright_fallback_urls = urls
+
+            # ── Phase 2: Playwright fallback ──────────────────────────────────
+            if playwright_fallback_urls and self.use_playwright and self.playwright_crawler:
+                try:
+                    pw_list = self.playwright_crawler.crawl_batch_sync(
+                        playwright_fallback_urls, existing_dates=existing_dates
+                    )
+                    for r in pw_list:
+                        url_r = r.get('url', '')
+                        if url_r:
+                            crawl_results[url_r] = r
+                except Exception as e:
+                    logger.error(f"❌ Playwright retry error: {e}")
+
+            # ── Process results ────────────────────────────────────────────────
+            resolved_urls = []
+            still_pending = []
+            to_write = []
+
+            for item in pending_items:
+                url = item['url']
+                record_id = item.get('record_id', '')
+                attempts = item.get('attempts', 1)
+
+                result = crawl_results.get(url)
+                if not result:
+                    still_pending.append({**item, 'attempts': attempts + 1})
+                    continue
+
+                if result.get('success') and result.get('views', 0) > 0:
+                    # Got data! Build a minimal processed record to write to sheets
+                    publish_date = result.get('publish_date') or existing_dates.get(url)
+                    to_write.append({
+                        'record_id': record_id,
+                        'link': url,
+                        'views': result['views'],
+                        'baseline': result.get('views', 0),  # first-time write, use as baseline
+                        'publish_date': publish_date,
+                        'status': 'success',
+                        'is_broken': False,
+                    })
+                    resolved_urls.append(url)
+                elif result.get('is_broken'):
+                    resolved_urls.append(url)  # Remove from pending (it's gone)
+                    logger.info(f"🔗 Pending URL confirmed broken, removing: {url[:50]}...")
+                elif attempts >= 3:
+                    # Give up after 3 total attempts
+                    resolved_urls.append(url)
+                    logger.warning(f"⚠️ Giving up on pending URL after 3 attempts: {url[:50]}...")
+                else:
+                    still_pending.append({**item, 'attempts': attempts + 1})
+
+            # Write resolved records to Lark Bitable
+            if to_write:
+                self.lark_client.batch_update_records(to_write)
+                logger.info(f"✅ Wrote {len(to_write)} resolved pending records to Lark")
+
+            # Update pending queue: remove resolved, keep still-pending
+            if resolved_urls or still_pending:
+                self.sheets_client.update_pending_retry(
+                    remove_urls=resolved_urls,
+                    update_items=still_pending,
+                )
+
+            stats = {
+                'retried': len(pending_items),
+                'resolved': len(resolved_urls),
+                'still_pending': len(still_pending),
+                'written_to_sheets': len(to_write),
+            }
+            logger.info(f"✅ Pending retry done: {stats}")
+            return {'success': True, 'message': 'Pending retry completed', 'stats': stats}
+
+        except Exception as e:
+            logger.error(f"❌ Pending retry failed: {e}")
+            return {'success': False, 'message': str(e), 'stats': {}}
+
     # Legacy method for single video (kept for compatibility)
     def get_tiktok_views(self, video_url: str) -> Optional[Dict]:
         """Get TikTok video stats using Playwright"""

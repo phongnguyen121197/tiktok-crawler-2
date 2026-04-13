@@ -246,6 +246,73 @@ STEALTH_SCRIPT = """
 # DATA EXTRACTION - MULTIPLE METHODS
 # ============================================================================
 
+async def check_page_data_status(page: Page) -> str:
+    """
+    Quick check (< 0.3s) whether TikTok has data available on this page.
+
+    Returns:
+        'ok'       - data containers look populated, proceed with extraction
+        'pending'  - page loaded but all data containers are empty/tiny
+                     (very new video: TikTok hasn't propagated data yet)
+        'broken'   - explicit 404 / "video unavailable" signal
+        'unknown'  - can't tell (page didn't load properly) → proceed anyway
+    """
+    try:
+        result = await page.evaluate("""() => {
+            // Check page title for explicit failure signals
+            const title = document.title || '';
+            const tl = title.toLowerCase();
+            if (tl.includes('page not found') || tl.includes('404')) {
+                return {status: 'broken', reason: 'title_404'};
+            }
+
+            // Scan known data containers for substantial content
+            const ids = [
+                '__UNIVERSAL_DATA_FOR_REHYDRATION__',
+                'SIGI_STATE',
+                '__NEXT_DATA__',
+            ];
+            let maxLen = 0;
+            for (const id of ids) {
+                const el = document.getElementById(id);
+                if (el && el.textContent) {
+                    maxLen = Math.max(maxLen, el.textContent.length);
+                }
+            }
+
+            // If any container has > 1000 chars there is likely real video data
+            if (maxLen > 1000) {
+                return {status: 'ok', reason: 'has_content_' + maxLen};
+            }
+
+            // Check UNIVERSAL_DATA status code for more specifics
+            const uEl = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
+            if (uEl && uEl.textContent && uEl.textContent.length > 50) {
+                try {
+                    const json = JSON.parse(uEl.textContent);
+                    const detail = json?.['__DEFAULT_SCOPE__']?.['webapp.video-detail'];
+                    const sc = detail?.statusCode;
+                    // 0 = success, but content could still be minimal (loading race)
+                    // Non-zero codes mean server explicitly said no data
+                    if (sc && sc !== 0) {
+                        return {status: 'pending', reason: 'status_code_' + sc};
+                    }
+                } catch(e) {}
+            }
+
+            // All containers empty/tiny → data not ready
+            if (maxLen < 100) {
+                return {status: 'pending', reason: 'empty_containers'};
+            }
+
+            return {status: 'unknown', reason: 'small_content_' + maxLen};
+        }""")
+
+        return result.get('status', 'unknown') if result else 'unknown'
+    except Exception:
+        return 'unknown'
+
+
 async def extract_video_data(page: Page, url: str) -> Optional[Dict]:
     """
     Extract video data using multiple methods with comprehensive fallbacks
@@ -684,7 +751,38 @@ class SequentialTikTokCrawler:
                 await page.wait_for_selector('script#__UNIVERSAL_DATA_FOR_REHYDRATION__', timeout=5000)
             except:
                 pass
-            
+
+            # ── FAST-FAIL CHECK ──────────────────────────────────────────────
+            # Detect immediately if TikTok has no data on this page so we avoid
+            # running all 5 extraction methods + 3 retries (~40-50s wasted).
+            page_status = await check_page_data_status(page)
+
+            if page_status == 'broken':
+                elapsed = time.time() - start_time
+                logger.warning(f"🔗 Fast-fail (broken) {elapsed:.1f}s: {url[:60]}...")
+                self.stats['failed'] += 1
+                return {
+                    'url': url, 'success': False, 'views': None,
+                    'likes': None, 'comments': None, 'shares': None,
+                    'publish_date': None,
+                    'error': 'video_unavailable', 'is_broken': True,
+                    'pending_propagation': False,
+                }
+
+            if page_status == 'pending':
+                elapsed = time.time() - start_time
+                logger.info(f"⏳ Fast-fail (pending) {elapsed:.1f}s: {url[:60]}...")
+                # Do NOT count as a failure — video will be retried later
+                return {
+                    'url': url, 'success': False, 'views': None,
+                    'likes': None, 'comments': None, 'shares': None,
+                    # Preserve existing date so date-filter works next run
+                    'publish_date': existing_publish_date if is_valid_publish_date(existing_publish_date) else None,
+                    'error': 'pending_propagation', 'is_broken': False,
+                    'pending_propagation': True,
+                }
+            # ── END FAST-FAIL ────────────────────────────────────────────────
+
             # Extract data
             data = await extract_video_data(page, url)
             
@@ -738,17 +836,18 @@ class SequentialTikTokCrawler:
             self.stats['failed'] += 1
             self.failed_urls.append(url)
             
-            # v3.2: Timeout could mean broken link
+            # Timeout — don't assume broken, preserve existing date
             return {
-                'url': url, 
-                'success': False, 
+                'url': url,
+                'success': False,
                 'views': None,
                 'likes': None,
                 'comments': None,
                 'shares': None,
-                'publish_date': None,  # Clear for potential broken link
+                'publish_date': existing_publish_date if is_valid_publish_date(existing_publish_date) else None,
                 'error': 'Timeout',
-                'is_broken': True
+                'is_broken': False,
+                'pending_propagation': False,
             }
             
         except Exception as e:
@@ -777,34 +876,52 @@ class SequentialTikTokCrawler:
             self.stats['failed'] += 1
             self.failed_urls.append(url)
             
-            # v3.2: Determine if broken link
-            is_broken = any(x in error_msg.lower() for x in ['not found', 'unavailable', 'removed', '404', 'no data'])
+            # Determine if broken link.
+            # NOTE: 'no data extracted' is NOT included here — that error means
+            # extraction failed but the video may still exist (e.g. TikTok changed
+            # their HTML structure). Clearing data for that would be destructive.
+            is_broken = any(x in error_msg.lower() for x in ['not found', 'unavailable', 'removed', '404'])
+            # Also propagate the pending_propagation flag from fast-fail if it
+            # somehow reaches the exception path.
+            is_pending = 'pending_propagation' in error_msg.lower()
             
-            if is_broken and self.config.clear_data_on_broken_link:
+            if is_pending:
+                return {
+                    'url': url,
+                    'success': False,
+                    'views': None, 'likes': None, 'comments': None, 'shares': None,
+                    'publish_date': existing_publish_date if is_valid_publish_date(existing_publish_date) else None,
+                    'error': error_msg,
+                    'is_broken': False,
+                    'pending_propagation': True,
+                }
+            elif is_broken and self.config.clear_data_on_broken_link:
                 logger.warning(f"🔗 Broken link: {error_msg}")
                 return {
-                    'url': url, 
-                    'success': False, 
+                    'url': url,
+                    'success': False,
                     'views': None,
                     'likes': None,
                     'comments': None,
                     'shares': None,
                     'publish_date': None,  # Clear for broken
                     'error': error_msg,
-                    'is_broken': True
+                    'is_broken': True,
+                    'pending_propagation': False,
                 }
             else:
                 # Not broken, just failed - preserve date if exists
                 return {
-                    'url': url, 
-                    'success': False, 
+                    'url': url,
+                    'success': False,
                     'views': None,
                     'likes': None,
                     'comments': None,
                     'shares': None,
                     'publish_date': existing_publish_date if is_valid_publish_date(existing_publish_date) else None,
                     'error': error_msg,
-                    'is_broken': False
+                    'is_broken': False,
+                    'pending_propagation': False,
                 }
             
         finally:
