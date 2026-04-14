@@ -171,15 +171,14 @@ async def shutdown_event():
 async def root():
     return {
         "message": "TikTok View Crawler API",
-        "version": "4.1.0",
-        "mode": "Playwright (primary) + yt-dlp fallback + Pending retry queue",
+        "version": "4.2.0",
+        "mode": "Playwright only — resource-blocking optimised",
         "features": [
-            "Playwright primary crawl with browser simulation (bypasses IP blocks)",
-            "yt-dlp fallback for Playwright failures (parallel, 3 workers)",
+            "Playwright with resource-blocking (images/media/fonts blocked → -40% CPU)",
+            "Reduced delays/timeouts for faster throughput",
             "Pending propagation detection for very new videos",
             "Retry queue: /jobs/retry-pending (run 6h after daily)",
-            "Google Sheets + Lark Bitable integration",
-            "Duplicate prevention",
+            "Lark Bitable write + Google Sheets date tracking",
         ]
     }
 

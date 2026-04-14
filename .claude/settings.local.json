@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:scrapfly.io)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:apify.com)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:dev.to)",
+      "WebFetch(domain:ensembledata.com)",
+      "WebFetch(domain:tikapi.io)",
+      "WebFetch(domain:crawlee.dev)",
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)",
+      "Bash(git push:*)",
+      "Bash(del D:\\\\tiktok-crawler\\\\app\\\\ytdlp_crawler.py)"
+    ]
+  }
+}

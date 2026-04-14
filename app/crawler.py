@@ -10,43 +10,25 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
     logging.warning("⚠️ Playwright not available, will use Lark data fallback only")
 
-# Import yt-dlp crawler (optional but strongly recommended)
-try:
-    from app.ytdlp_crawler import YtDlpCrawler
-    YTDLP_AVAILABLE = True
-except ImportError:
-    YTDLP_AVAILABLE = False
-    logging.warning("⚠️ yt-dlp not available. Install with: pip install yt-dlp")
-
 logger = logging.getLogger(__name__)
 
 class TikTokCrawler:
     """
-    TikTok Crawler v4.1 with Playwright (primary) + yt-dlp (fallback)
-    - Playwright: primary crawler, browser simulation bypasses IP blocks
-    - yt-dlp: fallback for Playwright failures (may be blocked on datacenter IPs)
+    TikTok Crawler v4.2 — Playwright only, optimised for low CPU/RAM
+    - Playwright: browser simulation, resource-blocking, fast timeouts
     - pending_propagation: new videos skipped + queued for retry after 6h
     - Broken link detection no longer clears data on transient failures
     """
 
     def __init__(self, lark_client, sheets_client, use_playwright=True):
-        """
-        Initialize crawler with Lark and Sheets clients.
-
-        Args:
-            lark_client: LarkClient instance
-            sheets_client: GoogleSheetsClient instance
-            use_playwright: Use Playwright as primary (default: True)
-        """
         self.lark_client = lark_client
         self.sheets_client = sheets_client
         self.use_playwright = use_playwright and PLAYWRIGHT_AVAILABLE
 
-        # Playwright crawler (primary)
         if self.use_playwright:
             try:
                 self.playwright_crawler = TikTokPlaywrightCrawler()
-                logger.info("✅ Playwright crawler initialized (primary)")
+                logger.info("✅ Playwright crawler initialized (v4.2 optimised)")
             except Exception as e:
                 logger.error(f"❌ Failed to initialize Playwright: {e}")
                 self.playwright_crawler = None
@@ -54,25 +36,7 @@ class TikTokCrawler:
         else:
             self.playwright_crawler = None
 
-        # yt-dlp crawler (fallback)
-        if YTDLP_AVAILABLE:
-            try:
-                self.ytdlp_crawler = YtDlpCrawler(max_workers=3)
-                logger.info("✅ yt-dlp crawler initialized (fallback)")
-            except Exception as e:
-                logger.error(f"❌ Failed to initialize yt-dlp: {e}")
-                self.ytdlp_crawler = None
-        else:
-            self.ytdlp_crawler = None
-
-        mode_parts = []
-        if self.use_playwright:
-            mode_parts.append("Playwright (primary)")
-        if self.ytdlp_crawler:
-            mode_parts.append("yt-dlp (fallback)")
-        if not mode_parts:
-            mode_parts.append("Lark data only")
-        logger.info(f"🔧 Crawler mode: {' + '.join(mode_parts)}")
+        logger.info(f"🔧 Crawler mode: {'Playwright' if self.use_playwright else 'Lark data only'}")
         
     def extract_video_id_from_url(self, url: str) -> Optional[str]:
         """Extract TikTok video ID from URL"""
@@ -443,13 +407,12 @@ class TikTokCrawler:
                     cutoff_str = f"{today.year}-{today.month - 1:02d}"
                 logger.info(f"📅 Date filter: crawling {len(urls_to_crawl)} recent videos (>= {cutoff_str}), skipping {skipped_old} old videos")
             
-            # Step 4: Crawl with Playwright (primary) + yt-dlp fallback
-            # Process in batches of INCREMENTAL_BATCH_SIZE so dates are saved
-            # progressively — if killed mid-run, completed batches are persisted.
+            # Step 4: Playwright crawl in incremental batches
+            # Batching ensures partial progress is saved if the run is interrupted.
             INCREMENTAL_BATCH_SIZE = 100
             total_to_crawl = len(urls_to_crawl)
             logger.info(
-                f"🔄 Starting incremental batch crawl v4.1 "
+                f"🔄 Starting incremental batch crawl v4.2 "
                 f"({total_to_crawl} videos, batch size {INCREMENTAL_BATCH_SIZE})..."
             )
 
@@ -470,9 +433,8 @@ class TikTokCrawler:
                     f"{len(batch_urls)} videos (progress: {batch_start}/{total_to_crawl})..."
                 )
 
-                # ── Phase 1: Playwright (primary, browser simulation) ─────────
+                # ── Playwright crawl ──────────────────────────────────────────
                 crawl_results = {}
-                ytdlp_fallback_urls = []
 
                 if self.use_playwright and self.playwright_crawler:
                     try:
@@ -482,35 +444,10 @@ class TikTokCrawler:
                         )
                         for r in pw_list:
                             url_r = r.get('url', '')
-                            if not url_r:
-                                continue
-                            if r.get('success'):
-                                crawl_results[url_r] = r
-                            elif r.get('pending_propagation') or r.get('is_broken'):
-                                # pending / broken → keep as-is, no yt-dlp needed
-                                crawl_results[url_r] = r
-                            else:
-                                # Transient Playwright failure → try yt-dlp
-                                ytdlp_fallback_urls.append(url_r)
-                    except Exception as e:
-                        logger.error(f"❌ Playwright batch {batch_num} error: {e}")
-                        ytdlp_fallback_urls = batch_urls  # fall back all
-                else:
-                    ytdlp_fallback_urls = batch_urls
-
-                # ── Phase 2: yt-dlp fallback (parallel, for Playwright misses) ─
-                if ytdlp_fallback_urls and self.ytdlp_crawler:
-                    logger.info(
-                        f"⚡ yt-dlp fallback: {len(ytdlp_fallback_urls)} URLs..."
-                    )
-                    try:
-                        ytdlp_list = self.ytdlp_crawler.crawl_batch(ytdlp_fallback_urls)
-                        for r in ytdlp_list:
-                            url_r = r.get('url', '')
                             if url_r:
                                 crawl_results[url_r] = r
                     except Exception as e:
-                        logger.error(f"❌ yt-dlp batch {batch_num} error: {e}")
+                        logger.error(f"❌ Playwright batch {batch_num} error: {e}")
 
                 # ── Process results ────────────────────────────────────────────
                 batch_processed = []
@@ -759,9 +696,8 @@ class TikTokCrawler:
             except Exception:
                 existing_dates = {}
 
-            # ── Phase 1: Playwright (primary) ─────────────────────────────────
+            # ── Playwright crawl ───────────────────────────────────────────────
             crawl_results = {}
-            ytdlp_fallback_urls = []
 
             if self.use_playwright and self.playwright_crawler:
                 try:
@@ -770,30 +706,10 @@ class TikTokCrawler:
                     )
                     for r in pw_list:
                         url_r = r.get('url', '')
-                        if not url_r:
-                            continue
-                        if r.get('success') or r.get('is_broken'):
-                            crawl_results[url_r] = r
-                        elif r.get('pending_propagation'):
-                            crawl_results[url_r] = r  # still pending
-                        else:
-                            ytdlp_fallback_urls.append(url_r)
-                except Exception as e:
-                    logger.error(f"❌ Playwright retry error: {e}")
-                    ytdlp_fallback_urls = urls
-            else:
-                ytdlp_fallback_urls = urls
-
-            # ── Phase 2: yt-dlp fallback ──────────────────────────────────────
-            if ytdlp_fallback_urls and self.ytdlp_crawler:
-                try:
-                    ytdlp_list = self.ytdlp_crawler.crawl_batch(ytdlp_fallback_urls)
-                    for r in ytdlp_list:
-                        url_r = r.get('url', '')
                         if url_r:
                             crawl_results[url_r] = r
                 except Exception as e:
-                    logger.error(f"❌ yt-dlp retry error: {e}")
+                    logger.error(f"❌ Playwright retry error: {e}")
 
             # ── Process results ────────────────────────────────────────────────
             resolved_urls = []

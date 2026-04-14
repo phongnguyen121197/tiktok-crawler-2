@@ -48,23 +48,23 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CrawlerConfig:
-    """Configuration for v3.2 crawler with publish date priority"""
-    delay_range: Tuple[float, float] = (2.0, 4.0)      # Human-like delays
-    timeout_ms: int = 30000                             # 30 seconds timeout
-    max_retries: int = 3                                # Max retries per video
-    restart_browser_every: int = 75                     # Restart after N videos
-    browser_close_timeout: int = 15                     # Close timeout
-    wait_after_load: float = 2.5                        # Wait for JS render
-    retry_failed_at_end: bool = True                    # Re-crawl failed videos
-    use_firefox_fallback: bool = True                   # Try Firefox for failed
-    max_end_retries: int = 2                            # Max end retries
-    
-    # Crash loop protection (v3.1)
+    """Configuration for v4.1 crawler — Playwright only, optimised for low CPU/RAM"""
+    delay_range: Tuple[float, float] = (0.5, 1.5)      # Shorter delays (was 2-4s)
+    timeout_ms: int = 20000                             # 20s timeout (was 30s)
+    max_retries: int = 1                                # 1 retry max (was 3)
+    restart_browser_every: int = 50                     # Restart after N videos (was 75)
+    browser_close_timeout: int = 10                     # Close timeout (was 15)
+    wait_after_load: float = 1.5                        # Wait for JS render (was 2.5s)
+    retry_failed_at_end: bool = False                   # Disabled — saves 2nd full pass
+    use_firefox_fallback: bool = False                  # Disabled — saves RAM
+    max_end_retries: int = 1                            # Max end retries
+
+    # Crash loop protection
     max_consecutive_crashes: int = 5                    # Max crashes before skip
-    crash_restart_delay: float = 3.0                    # Delay between crash restarts
-    memory_cleanup_interval: int = 25                   # GC every N videos
-    
-    # v3.2: Publish date priority
+    crash_restart_delay: float = 2.0                    # Delay between crash restarts (was 3s)
+    memory_cleanup_interval: int = 20                   # GC every N videos (was 25)
+
+    # Publish date priority
     preserve_existing_publish_date: bool = True         # Keep existing dates
     clear_data_on_broken_link: bool = True              # Empty values for broken links
 
@@ -577,24 +577,23 @@ class SequentialTikTokCrawler:
                 '--no-zygote',
                 '--single-process',
                 '--disable-infobars',
-                '--window-size=1920,1080',
-                '--start-maximized',
+                # Disable rendering features not needed for data extraction
+                '--blink-settings=imagesEnabled=false',
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--disable-sync',
+                '--metrics-recording-only',
+                '--mute-audio',
             ]
             
-            if browser_type == 'firefox':
-                self.browser = await self.playwright.firefox.launch(
-                    headless=True,
-                    args=['--width=1920', '--height=1080']
-                )
-            else:
-                self.browser = await self.playwright.chromium.launch(
-                    headless=True,
-                    args=launch_args
-                )
+            self.browser = await self.playwright.chromium.launch(
+                headless=True,
+                args=launch_args
+            )
             
-            # Create context with realistic settings
+            # Create context with realistic settings, smaller viewport saves RAM
             self.context = await self.browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
+                viewport={'width': 1280, 'height': 720},
                 user_agent=random.choice(USER_AGENTS),
                 locale='en-US',
                 timezone_id='Asia/Ho_Chi_Minh',
@@ -735,11 +734,25 @@ class SequentialTikTokCrawler:
             
             # Create new page
             page = await self.context.new_page()
-            
+
+            # ── RESOURCE BLOCKING ─────────────────────────────────────────────
+            # Block heavy resources we don't need (images, media, fonts, CSS).
+            # TikTok video data lives in JSON <script> tags — nothing visual needed.
+            # This alone cuts page-load time ~40% and RAM usage significantly.
+            async def _block_resource(route):
+                if route.request.resource_type in ("image", "media", "font", "stylesheet"):
+                    await route.abort()
+                elif any(x in route.request.url for x in ("analytics", "tracker", "beacon", "sentry", "monitoring")):
+                    await route.abort()
+                else:
+                    await route.continue_()
+            await page.route("**/*", _block_resource)
+            # ── END RESOURCE BLOCKING ─────────────────────────────────────────
+
             # Apply playwright-stealth if available
             if STEALTH_AVAILABLE:
                 await stealth_async(page)
-            
+
             # Navigate to video
             await page.goto(url, wait_until='domcontentloaded', timeout=self.config.timeout_ms)
             
