@@ -438,7 +438,6 @@ async def debug_lark_fields():
         write_fields_used = [
             'Lượt xem hiện tại',
             'Số view 24h trước',
-            'Published Date',
             'Lần kiểm tra cuối',
             'Status',
         ]

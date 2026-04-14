@@ -252,16 +252,13 @@ class LarkClient:
                 if not is_broken:
                     views = record.get('views')
                     baseline = record.get('baseline')
-                    publish_date = record.get('publish_date')
 
                     if views is not None:
                         fields['Lượt xem hiện tại'] = int(views)
                     if baseline is not None:
                         fields['Số view 24h trước'] = int(baseline)
-                    if publish_date:
-                        date_ms = self._date_str_to_ms(publish_date)
-                        if date_ms:
-                            fields['Published Date'] = date_ms
+                    # NOTE: 'Published Date' field does not exist in this Lark table.
+                    # Publish date is tracked in Google Sheets only.
 
                 update_records.append({'record_id': record_id, 'fields': fields})
 
