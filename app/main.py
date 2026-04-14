@@ -95,14 +95,14 @@ def _start_scheduler():
         try:
             from zoneinfo import ZoneInfo
             tz = ZoneInfo('Asia/Ho_Chi_Minh')
-            hour_utc, tz_label = 8, 'Asia/Ho_Chi_Minh'
+            hour_utc, tz_label = 7, 'Asia/Ho_Chi_Minh'
         except Exception:
             tz = 'UTC'
-            hour_utc, tz_label = 1, 'UTC (= 08:00 VN)'
+            hour_utc, tz_label = 0, 'UTC (= 07:00 VN)'
 
         scheduler = BackgroundScheduler(timezone=tz)
 
-        # Daily crawl at 08:00
+        # Daily crawl at 07:00 Vietnam time
         scheduler.add_job(
             run_daily_crawl,
             'cron',
@@ -114,7 +114,7 @@ def _start_scheduler():
             misfire_grace_time=3600,   # Allow up to 1h late start (e.g. cold boot)
         )
 
-        # Retry-pending at 14:00 (6 hours after daily crawl)
+        # Retry-pending at 13:00 (6 hours after daily crawl at 07:00)
         scheduler.add_job(
             _run_retry_pending,
             'cron',
