@@ -423,6 +423,39 @@ async def retry_pending_job(background_tasks: BackgroundTasks):
     }
 
 
+@app.get("/debug/lark-fields")
+async def debug_lark_fields():
+    """
+    List all field names and types from the Lark Bitable table.
+    Use this to diagnose FieldNameNotFound errors — compare the exact
+    field names returned here with what batch_update_records is writing.
+    """
+    if not lark_client:
+        return {"success": False, "error": "Lark client not initialized"}
+    try:
+        fields = lark_client.get_table_fields()
+        # Also show which names the code is currently trying to write
+        write_fields_used = [
+            'Lượt xem hiện tại',
+            'Số view 24h trước',
+            'Published Date',
+            'Lần kiểm tra cuối',
+            'Status',
+        ]
+        actual_names = [f['field_name'] for f in fields]
+        mismatches = [n for n in write_fields_used if n not in actual_names]
+        return {
+            "success": True,
+            "total_fields": len(fields),
+            "fields": fields,
+            "write_fields_used_by_code": write_fields_used,
+            "mismatches": mismatches,
+            "status": "✅ All write fields found" if not mismatches else f"❌ Mismatched: {mismatches}",
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 @app.get("/debug/info")
 async def debug_info():
     """

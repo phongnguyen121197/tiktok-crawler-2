@@ -287,10 +287,17 @@ class LarkClient:
                         f"✅ Lark: updated {len(updated_records)}/{len(update_records)} records"
                     )
                 else:
+                    error_code = data.get('code')
+                    error_msg = data.get('msg', '')
                     logger.error(
                         f"❌ Lark batch_update error "
-                        f"(code={data.get('code')}): {data.get('msg', '')}"
+                        f"(code={error_code}): {error_msg}"
                     )
+                    # Log full response and sample fields for debugging FieldNameNotFound
+                    if error_code == 1254045 and update_records:
+                        sample_fields = list(update_records[0].get('fields', {}).keys())
+                        logger.error(f"   Fields being written: {sample_fields}")
+                        logger.error(f"   Full response: {data}")
                     failed_total += len(update_records)
 
             except Exception as e:
@@ -303,6 +310,38 @@ class LarkClient:
 
         logger.info(f"📊 Lark write done: {updated_total} updated, {failed_total} failed")
         return (updated_total, failed_total)
+
+    def get_table_fields(self) -> list:
+        """
+        Get all field definitions from the Lark Bitable table.
+        Returns list of {field_id, field_name, field_type} dicts.
+        Useful for debugging FieldNameNotFound errors.
+        """
+        url = (
+            f"https://open.larksuite.com/open-apis/bitable/v1/apps/"
+            f"{self.bitable_app_token}/tables/{self.table_id}/fields"
+        )
+        try:
+            response = self._make_request('GET', url, params={'page_size': 100}, timeout=10)
+            if not response:
+                return []
+            data = response.json()
+            if data.get('code') == 0:
+                items = data.get('data', {}).get('items', [])
+                return [
+                    {
+                        'field_id': f.get('field_id'),
+                        'field_name': f.get('field_name'),
+                        'field_type': f.get('type'),
+                    }
+                    for f in items
+                ]
+            else:
+                logger.error(f"❌ get_table_fields error: {data}")
+                return []
+        except Exception as e:
+            logger.error(f"❌ get_table_fields exception: {e}")
+            return []
 
     def get_record(self, record_id):
         """Get single record by ID"""
