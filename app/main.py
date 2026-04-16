@@ -284,16 +284,22 @@ def run_daily_crawl():
         # Log success rate
         if result.get('success') and result.get('stats'):
             stats = result['stats']
-            total = stats.get('total', 0)
-            processed = stats.get('processed', 0)
-            failed = stats.get('failed', 0)
-            
-            if total > 0:
-                success_rate = (processed / total) * 100
-                logger.info(f"📊 Success rate: {success_rate:.1f}% ({processed}/{total})")
-                
-                if success_rate < 80:
-                    logger.warning(f"⚠️ Low success rate: {success_rate:.1f}%")
+            crawled = stats.get('crawled', 0)
+            success = stats.get('success', 0)
+            failed  = stats.get('failed', 0)
+            broken  = stats.get('broken', 0)
+            skipped = stats.get('skipped_old', 0)
+            lark_updated = stats.get('lark_updated', 0)
+
+            if crawled > 0:
+                success_rate = (success / crawled) * 100
+                logger.info(
+                    f"📊 Crawl success: {success_rate:.1f}% ({success}/{crawled}) | "
+                    f"failed={failed} broken={broken} skipped_old={skipped} | "
+                    f"lark_updated={lark_updated}"
+                )
+                if success_rate < 70:
+                    logger.warning(f"⚠️ Low crawl success rate: {success_rate:.1f}%")
         
     except Exception as e:
         logger.error(f"❌ Daily crawl failed: {e}", exc_info=True)
