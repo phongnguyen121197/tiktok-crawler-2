@@ -562,16 +562,34 @@ async def lark_oauth_start():
     if not lark_client:
         return {"success": False, "error": "Lark client not initialized"}
 
-    base_url = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RAILWAY_STATIC_URL", "")
+    # Build redirect_uri — try multiple env vars Railway may set
+    base_url = (
+        os.getenv("RAILWAY_PUBLIC_DOMAIN")
+        or os.getenv("RAILWAY_STATIC_URL")
+        or os.getenv("RAILWAY_SERVICE_URL")
+        or ""
+    )
     if base_url and not base_url.startswith("http"):
         base_url = f"https://{base_url}"
     redirect_uri = f"{base_url}/auth/lark/callback"
 
     oauth_url = lark_client.get_oauth_url(redirect_uri=redirect_uri)
-    logger.info(f"🔑 OAuth redirect_uri: {redirect_uri}")
+    logger.info(f"🔑 OAuth start | redirect_uri={redirect_uri}")
 
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url=oauth_url)
+    # Return info page instead of immediate redirect so user can verify URLs
+    from fastapi.responses import HTMLResponse
+    html = f"""
+    <html><body style="font-family:monospace;padding:20px;background:#111;color:#eee">
+    <h2>🔑 Lark OAuth Setup</h2>
+    <p><b>redirect_uri being used:</b><br>
+    <code style="background:#333;padding:4px">{redirect_uri}</code></p>
+    <p>⚠️ Make sure this EXACT URL is registered in Lark Developer Console → Security Settings → Redirect URLs</p>
+    <p><a href="{oauth_url}" style="color:#4af;font-size:18px">👉 Click here to authorize with Lark</a></p>
+    <hr>
+    <p>OAuth URL: <small>{oauth_url}</small></p>
+    </body></html>
+    """
+    return HTMLResponse(content=html)
 
 
 @app.get("/auth/lark/callback")
