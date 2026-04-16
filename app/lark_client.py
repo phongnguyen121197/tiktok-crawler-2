@@ -235,7 +235,7 @@ class LarkClient:
         """
         Read all records from write_table_id (target table) and return
         a {url: record_id} mapping so crawler can find the right record to update.
-        The target table must also have a "Link air bài" field.
+        The target table has a "Link TikTok" field (fldnv3knkY) that stores the URL.
         """
         api_url = (
             f"https://open.larksuite.com/open-apis/bitable/v1/apps/"
@@ -259,7 +259,7 @@ class LarkClient:
                 for item in items:
                     record_id = item.get('record_id') or item.get('id', '')
                     fields = item.get('fields', {})
-                    link_field = fields.get('Link air bài', '')
+                    link_field = fields.get('Link TikTok', '')
                     link_value = self._extract_link_value(link_field)
                     if link_value and record_id:
                         result[link_value] = record_id
@@ -404,8 +404,12 @@ class LarkClient:
                         fields['Lượt xem hiện tại'] = int(views)
                     if baseline is not None:
                         fields['Số view 24h trước'] = int(baseline)
-                    # NOTE: 'Published Date' field does not exist in this Lark table.
-                    # Publish date is tracked in Google Sheets only.
+                    # Write publish date to target table (fldWRnSR35, DateTime type 5)
+                    pub_date = record.get('publish_date')
+                    if pub_date:
+                        pub_ms = self._date_str_to_ms(pub_date)
+                        if pub_ms:
+                            fields['Published Date'] = pub_ms
 
                 update_records.append({'record_id': record_id, 'fields': fields})
 
