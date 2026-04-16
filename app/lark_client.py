@@ -438,9 +438,13 @@ class LarkClient:
                 items = data.get('data', {}).get('items', [])
                 return [
                     {
-                        'field_id': f.get('field_id'),
+                        'field_id':   f.get('field_id'),
                         'field_name': f.get('field_name'),
                         'field_type': f.get('type'),
+                        # Include full property blob so we can spot formula/lookup indicators
+                        'ui_type':    f.get('ui_type'),
+                        'property':   f.get('property'),
+                        'is_primary': f.get('is_primary'),
                     }
                     for f in items
                 ]
