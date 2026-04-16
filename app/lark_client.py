@@ -372,36 +372,41 @@ class LarkClient:
 
     def test_write_record(self, record_id: str, fields: dict) -> dict:
         """
-        Write fields to a single record and read it back immediately.
-        Used by /debug/test-lark-write to verify whether fields are actually writable.
+        Write fields using BATCH_UPDATE (same endpoint as production code),
+        then read back to verify actual change in Bitable.
 
-        Returns:
-            dict with keys: success, written_fields, before, after, changed_fields, api_response
+        Returns detailed diagnostic including raw API response body.
         """
         # Step 1: Read current values
         before_record = self.get_record(record_id)
         before_fields = before_record.get('fields', {}) if before_record else {}
 
-        # Step 2: Write test values
-        url = (
+        # Step 2: Write via batch_update (identical to production path)
+        batch_url = (
             f"https://open.larksuite.com/open-apis/bitable/v1/apps/"
-            f"{self.bitable_app_token}/tables/{self.table_id}/records/{record_id}"
+            f"{self.bitable_app_token}/tables/{self.table_id}/records/batch_update"
         )
-        write_payload = {'fields': fields}
+        write_payload = {
+            'records': [{'record_id': record_id, 'fields': fields}]
+        }
         try:
-            response = self._make_request('PUT', url, json=write_payload, timeout=15)
+            response = self._make_request('POST', batch_url, json=write_payload, timeout=15)
             if not response:
                 return {'success': False, 'error': 'No response from Lark API'}
             api_data = response.json()
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
-        # Step 3: Read back to verify
-        time.sleep(1)  # Brief wait for Lark to commit
+        # Extract what Lark says the record looks like after write
+        returned_records = api_data.get('data', {}).get('records', [])
+        returned_fields = returned_records[0].get('fields', {}) if returned_records else {}
+
+        # Step 3: Read back after a pause to check for caching issues
+        time.sleep(3)
         after_record = self.get_record(record_id)
         after_fields = after_record.get('fields', {}) if after_record else {}
 
-        # Step 4: Compare before vs after for each written field
+        # Step 4: Compare before vs after
         changed = {}
         not_changed = {}
         for field_name, new_val in fields.items():
@@ -410,17 +415,31 @@ class LarkClient:
             if str(after_val) != str(before_val):
                 changed[field_name] = {'before': before_val, 'after': after_val, 'expected': new_val}
             else:
-                not_changed[field_name] = {'before': before_val, 'after': after_val, 'expected': new_val}
+                not_changed[field_name] = {
+                    'before': before_val,
+                    'after': after_val,
+                    'expected': new_val,
+                    # What Lark PUT response says the value is NOW
+                    'in_write_response': returned_fields.get(field_name),
+                }
 
         return {
             'success': api_data.get('code') == 0,
             'api_code': api_data.get('code'),
             'api_msg': api_data.get('msg', ''),
             'written_fields': fields,
+            # What Lark returned in the write response (its view of the record)
+            'lark_write_response_fields': returned_fields,
             'fields_changed_in_bitable': changed,
             'fields_NOT_changed_in_bitable': not_changed,
             'verdict': (
                 '✅ Fields ARE writable' if changed and not not_changed
                 else ('⚠️ SOME fields writable' if changed else '❌ Fields are READ-ONLY (type 19 / formula?)')
+            ),
+            'hint': (
+                'API trả về success nhưng giá trị không thay đổi. '
+                'Kiểm tra: 1) Lark app có quyền WRITE chưa? '
+                '2) Xem "lark_write_response_fields" — nếu trả về đúng giá trị mới '
+                'thì đây là caching issue, nếu trả về giá trị cũ thì app thiếu quyền ghi.'
             ),
         }
