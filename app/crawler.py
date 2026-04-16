@@ -371,6 +371,21 @@ class TikTokCrawler:
             # Log existing dates stats from Lark
             valid_dates_lark = sum(1 for d in existing_dates.values() if d)
             logger.info(f"📅 Existing valid dates from Lark: {valid_dates_lark}/{len(urls)}")
+
+            # Step 2.1: Build URL → target record_id map from the WRITE table.
+            # Source and write tables are independent; record IDs differ.
+            target_record_by_url = {}
+            try:
+                target_record_by_url = self.lark_client.get_target_records_by_url()
+                logger.info(f"✅ Target table loaded: {len(target_record_by_url)} URL→record_id mappings")
+                no_target = [u for u in urls if u not in target_record_by_url]
+                if no_target:
+                    logger.warning(
+                        f"⚠️ {len(no_target)} source URLs have NO matching record in write table "
+                        f"(those won't be updated). Sample: {no_target[:3]}"
+                    )
+            except Exception as e:
+                logger.warning(f"⚠️ Could not load target table records: {e}. Writes will be skipped.")
             
             # Step 2.5: Merge dates from Google Sheets (where crawled dates are actually stored)
             # Lark may not have Published Date, but Sheets does from previous crawl runs
@@ -473,11 +488,18 @@ class TikTokCrawler:
                         processed = self.process_lark_record(record, tiktok_result)
 
                         if processed:
-                            batch_processed.append(processed)
-                            if processed.get('is_broken'):
-                                batch_broken += 1
-                            elif processed.get('status') != 'success':
-                                batch_failed += 1
+                            # Replace source record_id with target table's record_id
+                            target_rid = target_record_by_url.get(url)
+                            if not target_rid:
+                                logger.debug(f"⏭️ No target record for URL, skipping write: {url[:60]}")
+                                # Don't count as failure — it's a configuration gap
+                            else:
+                                processed['record_id'] = target_rid
+                                batch_processed.append(processed)
+                                if processed.get('is_broken'):
+                                    batch_broken += 1
+                                elif processed.get('status') != 'success':
+                                    batch_failed += 1
                         else:
                             batch_failed += 1
                     except Exception as e:
@@ -692,6 +714,14 @@ class TikTokCrawler:
             urls = [item['url'] for item in pending_items]
             url_to_item = {item['url']: item for item in pending_items}
 
+            # Load target table URL→record_id mapping
+            target_record_by_url = {}
+            try:
+                target_record_by_url = self.lark_client.get_target_records_by_url()
+                logger.info(f"✅ Retry: target table {len(target_record_by_url)} URL mappings loaded")
+            except Exception as e:
+                logger.warning(f"⚠️ Retry: could not load target table records: {e}")
+
             # Build existing_dates from Sheets for date preservation
             try:
                 existing_dates = self.sheets_client.get_publish_dates_by_link()
@@ -729,10 +759,11 @@ class TikTokCrawler:
                     continue
 
                 if result.get('success') and result.get('views', 0) > 0:
-                    # Got data! Build a minimal processed record to write to sheets
+                    # Got data! Use target table record_id for writing
                     publish_date = result.get('publish_date') or existing_dates.get(url)
+                    target_rid = target_record_by_url.get(url) or record_id
                     to_write.append({
-                        'record_id': record_id,
+                        'record_id': target_rid,
                         'link': url,
                         'views': result['views'],
                         'baseline': result.get('views', 0),  # first-time write, use as baseline

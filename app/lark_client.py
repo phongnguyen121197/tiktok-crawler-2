@@ -6,11 +6,13 @@ logger = logging.getLogger(__name__)
 
 class LarkClient:
     def __init__(self, app_id, app_secret, bitable_app_token, table_id,
-                 user_refresh_token: str = None):
+                 user_refresh_token: str = None, write_table_id: str = None):
         self.app_id = app_id
         self.app_secret = app_secret
         self.bitable_app_token = bitable_app_token
-        self.table_id = table_id
+        self.table_id = table_id          # Source table — read "Link air bài"
+        # Target table — write view data. Falls back to table_id if not set.
+        self.write_table_id = write_table_id or table_id
 
         # ── Tenant token (read-only for Bitable in some workspaces) ──────────
         self.tenant_access_token = None
@@ -229,6 +231,47 @@ class LarkClient:
         # Default
         return ""
     
+    def get_target_records_by_url(self) -> dict:
+        """
+        Read all records from write_table_id (target table) and return
+        a {url: record_id} mapping so crawler can find the right record to update.
+        The target table must also have a "Link air bài" field.
+        """
+        api_url = (
+            f"https://open.larksuite.com/open-apis/bitable/v1/apps/"
+            f"{self.bitable_app_token}/tables/{self.write_table_id}/records"
+        )
+        result = {}
+        page_token = None
+        try:
+            while True:
+                params = {'page_size': 500}
+                if page_token:
+                    params['page_token'] = page_token
+                response = self._make_request('GET', api_url, params=params, timeout=30)
+                if not response:
+                    break
+                data = response.json()
+                if data.get('code') != 0:
+                    logger.error(f"❌ get_target_records_by_url error: {data}")
+                    break
+                items = data.get('data', {}).get('items', [])
+                for item in items:
+                    record_id = item.get('record_id') or item.get('id', '')
+                    fields = item.get('fields', {})
+                    link_field = fields.get('Link air bài', '')
+                    link_value = self._extract_link_value(link_field)
+                    if link_value and record_id:
+                        result[link_value] = record_id
+                page_token = data.get('data', {}).get('page_token')
+                if not page_token:
+                    break
+            logger.info(f"✅ Target table ({self.write_table_id}): {len(result)} URL→record_id mappings loaded")
+            return result
+        except Exception as e:
+            logger.error(f"❌ get_target_records_by_url exception: {e}")
+            return {}
+
     def get_all_active_records(self):
         """
         Get all records with non-empty "Link air bài" field from Lark Bitable
@@ -335,7 +378,7 @@ class LarkClient:
 
         url = (
             f"https://open.larksuite.com/open-apis/bitable/v1/apps/"
-            f"{self.bitable_app_token}/tables/{self.table_id}/records/batch_update"
+            f"{self.bitable_app_token}/tables/{self.write_table_id}/records/batch_update"
         )
 
         for i in range(0, len(records), LARK_BATCH_SIZE):
@@ -419,15 +462,19 @@ class LarkClient:
         logger.info(f"📊 Lark write done: {updated_total} updated, {failed_total} failed")
         return (updated_total, failed_total)
 
-    def get_table_fields(self) -> list:
+    def get_table_fields(self, table_id: str = None) -> list:
         """
         Get all field definitions from the Lark Bitable table.
         Returns list of {field_id, field_name, field_type} dicts.
         Useful for debugging FieldNameNotFound errors.
+
+        Args:
+            table_id: override which table to query (default: self.table_id / source table)
         """
+        tbl = table_id or self.table_id
         url = (
             f"https://open.larksuite.com/open-apis/bitable/v1/apps/"
-            f"{self.bitable_app_token}/tables/{self.table_id}/fields"
+            f"{self.bitable_app_token}/tables/{tbl}/fields"
         )
         try:
             response = self._make_request('GET', url, params={'page_size': 100}, timeout=10)
@@ -455,9 +502,10 @@ class LarkClient:
             logger.error(f"❌ get_table_fields exception: {e}")
             return []
 
-    def get_record(self, record_id):
-        """Get single record by ID"""
-        url = f"https://open.larksuite.com/open-apis/bitable/v1/apps/{self.bitable_app_token}/tables/{self.table_id}/records/{record_id}"
+    def get_record(self, record_id, table_id: str = None):
+        """Get single record by ID (defaults to write_table_id / target table)"""
+        tbl = table_id or self.write_table_id
+        url = f"https://open.larksuite.com/open-apis/bitable/v1/apps/{self.bitable_app_token}/tables/{tbl}/records/{record_id}"
 
         try:
             response = self._make_request('GET', url, timeout=10)
@@ -491,7 +539,7 @@ class LarkClient:
         # Step 2: Write via batch_update (identical to production path)
         batch_url = (
             f"https://open.larksuite.com/open-apis/bitable/v1/apps/"
-            f"{self.bitable_app_token}/tables/{self.table_id}/records/batch_update"
+            f"{self.bitable_app_token}/tables/{self.write_table_id}/records/batch_update"
         )
         write_payload = {
             'records': [{'record_id': record_id, 'fields': fields}]

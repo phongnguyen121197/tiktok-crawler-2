@@ -40,7 +40,8 @@ def init_clients():
             app_id=os.getenv("LARK_APP_ID"),
             app_secret=os.getenv("LARK_APP_SECRET"),
             bitable_app_token=os.getenv("LARK_BITABLE_TOKEN"),
-            table_id=os.getenv("LARK_TABLE_ID"),
+            table_id=os.getenv("LARK_TABLE_ID"),          # Source: read "Link air bài"
+            write_table_id=os.getenv("LARK_WRITE_TABLE_ID"),  # Target: write view data
             user_refresh_token=os.getenv("LARK_USER_REFRESH_TOKEN"),  # optional, enables user-token writes
         )
         logger.info("✅ Lark client initialized successfully")
@@ -432,30 +433,42 @@ async def retry_pending_job(background_tasks: BackgroundTasks):
 @app.get("/debug/lark-fields")
 async def debug_lark_fields():
     """
-    List all field names and types from the Lark Bitable table.
-    Use this to diagnose FieldNameNotFound errors — compare the exact
-    field names returned here with what batch_update_records is writing.
+    List all field names/types from BOTH Lark tables:
+      - Source table (LARK_TABLE_ID)      → read "Link air bài"
+      - Target table (LARK_WRITE_TABLE_ID) → write view data
     """
     if not lark_client:
         return {"success": False, "error": "Lark client not initialized"}
     try:
-        fields = lark_client.get_table_fields()
-        # Also show which names the code is currently trying to write
+        source_fields = lark_client.get_table_fields(table_id=lark_client.table_id)
+        write_fields  = lark_client.get_table_fields(table_id=lark_client.write_table_id)
+
         write_fields_used = [
             'Lượt xem hiện tại',
             'Số view 24h trước',
             'Lần kiểm tra cuối',
             'Status',
         ]
-        actual_names = [f['field_name'] for f in fields]
-        mismatches = [n for n in write_fields_used if n not in actual_names]
+        actual_write_names = [f['field_name'] for f in write_fields]
+        mismatches = [n for n in write_fields_used if n not in actual_write_names]
+
         return {
             "success": True,
-            "total_fields": len(fields),
-            "fields": fields,
+            "source_table": {
+                "table_id": lark_client.table_id,
+                "purpose": "Read links (Link air bài)",
+                "total_fields": len(source_fields),
+                "fields": source_fields,
+            },
+            "write_table": {
+                "table_id": lark_client.write_table_id,
+                "purpose": "Write view data",
+                "total_fields": len(write_fields),
+                "fields": write_fields,
+            },
             "write_fields_used_by_code": write_fields_used,
-            "mismatches": mismatches,
-            "status": "✅ All write fields found" if not mismatches else f"❌ Mismatched: {mismatches}",
+            "mismatches_in_write_table": mismatches,
+            "status": "✅ All write fields found in target table" if not mismatches else f"❌ Mismatched in target table: {mismatches}",
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -480,25 +493,25 @@ async def debug_test_lark_write():
         return {"success": False, "error": "Lark client not initialized"}
 
     try:
-        # Get first available record
-        records = lark_client.get_all_active_records()
-        if not records:
-            return {"success": False, "error": "No records found in Lark table"}
-
-        first = records[0]
-        # Support both 'record_id' and 'id' keys
-        record_id = first.get('record_id') or first.get('id', '')
-        if not record_id:
+        # Get record_id from the TARGET (write) table, not the source table.
+        # We match by URL: load target table URL→record_id map, take any first entry.
+        target_map = lark_client.get_target_records_by_url()
+        if not target_map:
             return {
                 "success": False,
-                "error": "Could not extract record_id from first record",
-                "raw_keys": list(first.keys()),
+                "error": "No records found in write table (LARK_WRITE_TABLE_ID). "
+                         "Check that the target table has a 'Link air bài' field with data.",
+                "write_table_id": lark_client.write_table_id,
             }
+
+        # Pick first URL/record_id from target table
+        first_url, record_id = next(iter(target_map.items()))
 
         now_ms = int(datetime.now().timestamp() * 1000)
 
-        # Read current views so we can write +1 to detect change
-        current_fields = first.get('fields', {})
+        # Read current field values from target record before writing
+        current_record = lark_client.get_record(record_id)
+        current_fields = current_record.get('fields', {}) if current_record else {}
         current_views_raw = current_fields.get('Lượt xem hiện tại', 0)
         if isinstance(current_views_raw, list):
             current_views = int(current_views_raw[0]) if current_views_raw else 0
@@ -513,12 +526,17 @@ async def debug_test_lark_write():
             'Status': 'test_write_check',              # Text: test marker
         }
 
-        logger.info(f"🧪 Testing write on record {record_id}: views {current_views} → {current_views+1}")
+        logger.info(
+            f"🧪 Testing write on target table {lark_client.write_table_id} "
+            f"record {record_id} (url={first_url[:50]}): views {current_views} → {current_views+1}"
+        )
         result = lark_client.test_write_record(record_id, test_fields)
 
         return {
             "success": True,
+            "write_table_id": lark_client.write_table_id,
             "record_id_used": record_id,
+            "url_of_record": first_url,
             "current_views_before_test": current_views,
             **result,
         }
@@ -537,6 +555,8 @@ async def debug_info():
     return {
         "environment": {
             "lark_configured": bool(os.getenv("LARK_APP_ID")),
+            "lark_source_table": os.getenv("LARK_TABLE_ID", "(not set)"),
+            "lark_write_table": os.getenv("LARK_WRITE_TABLE_ID", "(not set — using source table)"),
             "sheets_configured": bool(os.getenv("GOOGLE_SHEET_ID")),
             "railway_env": bool(os.getenv("RAILWAY_ENVIRONMENT"))
         },
