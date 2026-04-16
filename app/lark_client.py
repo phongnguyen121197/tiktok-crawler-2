@@ -25,6 +25,8 @@ class LarkClient:
 
         # Bootstrap tokens
         self._refresh_tenant_token()
+        # Prefer file-persisted token (newer after rotation) over env var
+        self._load_persisted_token()
         if self.user_refresh_token:
             self._refresh_user_token()
             logger.info("✅ User token mode enabled — Bitable writes will use user identity")
@@ -60,6 +62,31 @@ class LarkClient:
 
     # ── User token ────────────────────────────────────────────────────────────
 
+    # Path where rotated refresh token is persisted across restarts
+    _TOKEN_FILE = "/tmp/lark_refresh_token.txt"
+
+    def _load_persisted_token(self):
+        """On startup, prefer the persisted token file over the env var (it's newer)."""
+        try:
+            import os as _os
+            if _os.path.exists(self._TOKEN_FILE):
+                with open(self._TOKEN_FILE, 'r') as f:
+                    tok = f.read().strip()
+                if tok:
+                    logger.info("🔑 Loaded persisted refresh token from file (overrides env var)")
+                    self.user_refresh_token = tok
+        except Exception as e:
+            logger.warning(f"⚠️ Could not load persisted token: {e}")
+
+    def _persist_token(self, refresh_token: str):
+        """Save the latest refresh token to disk so restarts don't lose it."""
+        try:
+            with open(self._TOKEN_FILE, 'w') as f:
+                f.write(refresh_token)
+            logger.info("💾 Rotated refresh token persisted to file")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not persist refresh token: {e}")
+
     def _refresh_user_token(self):
         """Use stored refresh_token to get a new user access_token."""
         if not self.user_refresh_token:
@@ -79,10 +106,11 @@ class LarkClient:
                 self.user_access_token = d.get("access_token")
                 expires_in = int(d.get("expires_in", 7200))
                 self.user_expire_time = time.time() + expires_in - 300
-                # Lark may rotate the refresh token — update it
+                # Lark rotates the refresh token on every use — save the new one
                 new_rt = d.get("refresh_token")
-                if new_rt:
+                if new_rt and new_rt != self.user_refresh_token:
                     self.user_refresh_token = new_rt
+                    self._persist_token(new_rt)
                 logger.info("✅ User access token refreshed")
                 return True
             logger.error(f"❌ User token refresh failed: {data}")
@@ -95,6 +123,9 @@ class LarkClient:
         self.user_access_token = access_token
         self.user_refresh_token = refresh_token
         self.user_expire_time = time.time() + expires_in - 300
+        # Persist so the token survives Railway restarts
+        if refresh_token:
+            self._persist_token(refresh_token)
         logger.info("✅ User tokens set via OAuth callback")
 
     def _get_user_token(self):
