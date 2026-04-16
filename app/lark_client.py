@@ -428,18 +428,13 @@ class LarkClient:
             'api_code': api_data.get('code'),
             'api_msg': api_data.get('msg', ''),
             'written_fields': fields,
-            # What Lark returned in the write response (its view of the record)
+            # Raw response from Lark (full data section) — key diagnostic
+            'lark_raw_response': api_data.get('data', {}),
             'lark_write_response_fields': returned_fields,
             'fields_changed_in_bitable': changed,
             'fields_NOT_changed_in_bitable': not_changed,
             'verdict': (
                 '✅ Fields ARE writable' if changed and not not_changed
-                else ('⚠️ SOME fields writable' if changed else '❌ Fields are READ-ONLY (type 19 / formula?)')
-            ),
-            'hint': (
-                'API trả về success nhưng giá trị không thay đổi. '
-                'Kiểm tra: 1) Lark app có quyền WRITE chưa? '
-                '2) Xem "lark_write_response_fields" — nếu trả về đúng giá trị mới '
-                'thì đây là caching issue, nếu trả về giá trị cũ thì app thiếu quyền ghi.'
+                else ('⚠️ SOME fields writable' if changed else '❌ Fields are READ-ONLY or write REJECTED')
             ),
         }

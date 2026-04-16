@@ -495,24 +495,31 @@ async def debug_test_lark_write():
             }
 
         now_ms = int(datetime.now().timestamp() * 1000)
+
+        # Read current views so we can write +1 to detect change
+        current_fields = first.get('fields', {})
+        current_views_raw = current_fields.get('Lượt xem hiện tại', 0)
+        if isinstance(current_views_raw, list):
+            current_views = int(current_views_raw[0]) if current_views_raw else 0
+        else:
+            current_views = int(current_views_raw) if current_views_raw else 0
+
+        # Test ALL 4 write fields at once (same as production)
         test_fields = {
-            'Status': 'test_write_check',
-            'Lần kiểm tra cuối': now_ms,
+            'Lượt xem hiện tại': current_views + 1,   # Number: increment by 1
+            'Số view 24h trước': current_views,        # Number: set to current views
+            'Lần kiểm tra cuối': now_ms,               # DateTime: current timestamp
+            'Status': 'test_write_check',              # Text: test marker
         }
 
-        logger.info(f"🧪 Testing write on record {record_id} with fields: {list(test_fields.keys())}")
+        logger.info(f"🧪 Testing write on record {record_id}: views {current_views} → {current_views+1}")
         result = lark_client.test_write_record(record_id, test_fields)
 
         return {
             "success": True,
             "record_id_used": record_id,
-            "record_id_source": "record_id key" if first.get('record_id') else "id key",
+            "current_views_before_test": current_views,
             **result,
-            "explanation": (
-                "If 'fields_NOT_changed_in_bitable' contains your write fields, "
-                "those fields are READ-ONLY in Lark (likely type 19 = Formula/AutoNumber). "
-                "Go to Lark Bitable → field settings → change field type to Number / Text / DateTime."
-            ),
         }
 
     except Exception as e:
