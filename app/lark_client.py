@@ -62,12 +62,13 @@ class LarkClient:
         """Use stored refresh_token to get a new user access_token."""
         if not self.user_refresh_token:
             return False
-        url = "https://open.larksuite.com/open-apis/authen/v1/oidc/refresh_access_token"
+        url = "https://open.larksuite.com/open-apis/authen/v1/refresh_access_token"
+        app_token = self._get_tenant_token()
         try:
             resp = requests.post(
                 url,
                 json={"grant_type": "refresh_token", "refresh_token": self.user_refresh_token},
-                headers={"Authorization": f"Basic {self._basic_auth()}"},
+                headers={"Authorization": f"Bearer {app_token}"},
                 timeout=10,
             )
             data = resp.json()
@@ -76,7 +77,7 @@ class LarkClient:
                 self.user_access_token = d.get("access_token")
                 expires_in = int(d.get("expires_in", 7200))
                 self.user_expire_time = time.time() + expires_in - 300
-                # Lark may rotate the refresh token on each refresh — update it
+                # Lark may rotate the refresh token — update it
                 new_rt = d.get("refresh_token")
                 if new_rt:
                     self.user_refresh_token = new_rt
@@ -118,12 +119,13 @@ class LarkClient:
 
     def exchange_code_for_tokens(self, code: str) -> dict:
         """Exchange OAuth authorization code for access + refresh tokens."""
-        url = "https://open.larksuite.com/open-apis/authen/v1/oidc/access_token"
+        url = "https://open.larksuite.com/open-apis/authen/v1/access_token"
+        app_token = self._get_tenant_token()
         try:
             resp = requests.post(
                 url,
                 json={"grant_type": "authorization_code", "code": code},
-                headers={"Authorization": f"Basic {self._basic_auth()}"},
+                headers={"Authorization": f"Bearer {app_token}"},
                 timeout=10,
             )
             data = resp.json()
