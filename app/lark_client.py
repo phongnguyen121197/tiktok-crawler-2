@@ -5,93 +5,194 @@ import logging
 logger = logging.getLogger(__name__)
 
 class LarkClient:
-    def __init__(self, app_id, app_secret, bitable_app_token, table_id):
+    def __init__(self, app_id, app_secret, bitable_app_token, table_id,
+                 user_refresh_token: str = None):
         self.app_id = app_id
         self.app_secret = app_secret
         self.bitable_app_token = bitable_app_token
         self.table_id = table_id
-        
-        # Token cache
+
+        # ── Tenant token (read-only for Bitable in some workspaces) ──────────
         self.tenant_access_token = None
-        self.token_expire_time = 0
-        
-        # Get initial token
-        self._refresh_token()
-    
-    def _refresh_token(self):
-        """Refresh tenant access token"""
+        self.tenant_expire_time = 0
+
+        # ── User token (has edit access if the user owns the Bitable) ────────
+        self.user_access_token = None
+        self.user_expire_time = 0
+        self.user_refresh_token = user_refresh_token  # long-lived, stored in env
+
+        # Bootstrap tokens
+        self._refresh_tenant_token()
+        if self.user_refresh_token:
+            self._refresh_user_token()
+            logger.info("✅ User token mode enabled — Bitable writes will use user identity")
+        else:
+            logger.warning(
+                "⚠️  No LARK_USER_REFRESH_TOKEN set. "
+                "Bitable writes use tenant token (may be read-only). "
+                "Run GET /auth/lark to obtain a user token."
+            )
+
+    # ── Tenant token ──────────────────────────────────────────────────────────
+
+    def _refresh_tenant_token(self):
+        """Refresh app-level tenant access token."""
         url = "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
-        
-        payload = {
-            "app_id": self.app_id,
-            "app_secret": self.app_secret
-        }
-        
         try:
-            response = requests.post(url, json=payload, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
+            resp = requests.post(url, json={"app_id": self.app_id, "app_secret": self.app_secret}, timeout=10)
+            data = resp.json()
             if data.get("code") == 0:
-                self.tenant_access_token = data.get("tenant_access_token")
-                # Token valid for 2 hours, refresh after 1.5 hours to be safe
-                self.token_expire_time = time.time() + 5400  # 1.5 hours = 5400 seconds
-                logger.info("✅ Lark token refreshed successfully")
+                self.tenant_access_token = data["tenant_access_token"]
+                self.tenant_expire_time = time.time() + 5400
+                logger.info("✅ Tenant token refreshed")
                 return True
-            else:
-                logger.error(f"❌ Failed to refresh token: {data}")
-                return False
-                
+            logger.error(f"❌ Tenant token refresh failed: {data}")
         except Exception as e:
-            logger.error(f"❌ Error refreshing token: {e}")
-            return False
-    
-    def _get_valid_token(self):
-        """Get valid token, refresh if expired"""
-        current_time = time.time()
-        
-        # If token expired or will expire in 5 minutes, refresh
-        if not self.tenant_access_token or current_time >= (self.token_expire_time - 300):
-            logger.info("🔄 Token expired or expiring soon, refreshing...")
-            self._refresh_token()
-        
+            logger.error(f"❌ Tenant token refresh error: {e}")
+        return False
+
+    def _get_tenant_token(self):
+        if not self.tenant_access_token or time.time() >= self.tenant_expire_time - 300:
+            self._refresh_tenant_token()
         return self.tenant_access_token
-    
+
+    # ── User token ────────────────────────────────────────────────────────────
+
+    def _refresh_user_token(self):
+        """Use stored refresh_token to get a new user access_token."""
+        if not self.user_refresh_token:
+            return False
+        url = "https://open.larksuite.com/open-apis/authen/v1/oidc/refresh_access_token"
+        try:
+            resp = requests.post(
+                url,
+                json={"grant_type": "refresh_token", "refresh_token": self.user_refresh_token},
+                headers={"Authorization": f"Basic {self._basic_auth()}"},
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("code") == 0:
+                d = data.get("data", {})
+                self.user_access_token = d.get("access_token")
+                expires_in = int(d.get("expires_in", 7200))
+                self.user_expire_time = time.time() + expires_in - 300
+                # Lark may rotate the refresh token on each refresh — update it
+                new_rt = d.get("refresh_token")
+                if new_rt:
+                    self.user_refresh_token = new_rt
+                logger.info("✅ User access token refreshed")
+                return True
+            logger.error(f"❌ User token refresh failed: {data}")
+        except Exception as e:
+            logger.error(f"❌ User token refresh error: {e}")
+        return False
+
+    def set_user_tokens(self, access_token: str, refresh_token: str, expires_in: int = 7200):
+        """Called after OAuth callback to store the freshly-obtained tokens."""
+        self.user_access_token = access_token
+        self.user_refresh_token = refresh_token
+        self.user_expire_time = time.time() + expires_in - 300
+        logger.info("✅ User tokens set via OAuth callback")
+
+    def _get_user_token(self):
+        if not self.user_access_token or time.time() >= self.user_expire_time:
+            self._refresh_user_token()
+        return self.user_access_token
+
+    def _basic_auth(self) -> str:
+        """Base64-encoded app_id:app_secret for Basic auth header."""
+        import base64
+        creds = f"{self.app_id}:{self.app_secret}"
+        return base64.b64encode(creds.encode()).decode()
+
+    def get_oauth_url(self, redirect_uri: str, state: str = "lark_oauth") -> str:
+        """Build the Lark OAuth authorization URL."""
+        import urllib.parse
+        params = {
+            "app_id": self.app_id,
+            "redirect_uri": redirect_uri,
+            "scope": "bitable:app",
+            "state": state,
+        }
+        return "https://open.larksuite.com/open-apis/authen/v1/authorize?" + urllib.parse.urlencode(params)
+
+    def exchange_code_for_tokens(self, code: str) -> dict:
+        """Exchange OAuth authorization code for access + refresh tokens."""
+        url = "https://open.larksuite.com/open-apis/authen/v1/oidc/access_token"
+        try:
+            resp = requests.post(
+                url,
+                json={"grant_type": "authorization_code", "code": code},
+                headers={"Authorization": f"Basic {self._basic_auth()}"},
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("code") == 0:
+                d = data.get("data", {})
+                self.set_user_tokens(
+                    access_token=d.get("access_token", ""),
+                    refresh_token=d.get("refresh_token", ""),
+                    expires_in=int(d.get("expires_in", 7200)),
+                )
+                return {"success": True, "data": d}
+            return {"success": False, "error": data}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # ── Unified request helper ─────────────────────────────────────────────────
+
+    def _get_write_token(self):
+        """Return user token for writes if available, else tenant token."""
+        if self.user_refresh_token or self.user_access_token:
+            tok = self._get_user_token()
+            if tok:
+                return tok
+            logger.warning("⚠️ User token unavailable, falling back to tenant token for write")
+        return self._get_tenant_token()
+
+    def _refresh_token(self):
+        """Legacy alias kept for compatibility."""
+        return self._refresh_tenant_token()
+
+    def _get_valid_token(self):
+        """Legacy alias — returns tenant token (used for reads)."""
+        return self._get_tenant_token()
+
     def _make_request(self, method, url, **kwargs):
-        """Make HTTP request with auto token refresh"""
+        """Make HTTP request. Reads use tenant token; writes use user token."""
+        # Determine which token to use based on HTTP method
+        is_write = method.upper() in ('POST', 'PUT', 'PATCH', 'DELETE')
+        get_token = self._get_write_token if is_write else self._get_tenant_token
+
         max_retries = 2
-        
         for attempt in range(max_retries):
-            token = self._get_valid_token()
-            
+            token = get_token()
             if not token:
                 logger.error("❌ Failed to get valid token")
                 return None
-            
-            headers = kwargs.get('headers', {})
+
+            headers = dict(kwargs.get('headers', {}))
             headers['Authorization'] = f'Bearer {token}'
             kwargs['headers'] = headers
-            
+
             try:
                 response = requests.request(method, url, **kwargs)
                 data = response.json()
-                
-                # If token invalid (99991663), refresh and retry
+
                 if data.get('code') == 99991663:
-                    logger.warning(f"⚠️ Token invalid (attempt {attempt + 1}/{max_retries}), refreshing...")
-                    self._refresh_token()
+                    logger.warning(f"⚠️ Token invalid (attempt {attempt+1}), refreshing...")
+                    if is_write:
+                        self._refresh_user_token()
+                    else:
+                        self._refresh_tenant_token()
                     if attempt < max_retries - 1:
                         continue
-                    else:
-                        return response
-                
                 return response
-                
+
             except Exception as e:
-                logger.error(f"❌ Request error on attempt {attempt + 1}: {e}")
+                logger.error(f"❌ Request error attempt {attempt+1}: {e}")
                 if attempt == max_retries - 1:
                     raise
-        
         return None
     
     def _extract_link_value(self, link_field):

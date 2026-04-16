@@ -40,7 +40,8 @@ def init_clients():
             app_id=os.getenv("LARK_APP_ID"),
             app_secret=os.getenv("LARK_APP_SECRET"),
             bitable_app_token=os.getenv("LARK_BITABLE_TOKEN"),
-            table_id=os.getenv("LARK_TABLE_ID")
+            table_id=os.getenv("LARK_TABLE_ID"),
+            user_refresh_token=os.getenv("LARK_USER_REFRESH_TOKEN"),  # optional, enables user-token writes
         )
         logger.info("✅ Lark client initialized successfully")
     except Exception as e:
@@ -548,6 +549,82 @@ async def debug_info():
         "version": "2.3.0",
         "timestamp": datetime.now().isoformat()
     }
+
+# ── Lark OAuth endpoints (one-time setup to get user refresh token) ───────────
+
+@app.get("/auth/lark")
+async def lark_oauth_start():
+    """
+    Step 1 — Open this URL in a browser while logged into Lark as the Bitable owner.
+    You will be redirected to Lark's login page. After approving, Lark sends you
+    back to /auth/lark/callback with an auth code.
+    """
+    if not lark_client:
+        return {"success": False, "error": "Lark client not initialized"}
+
+    base_url = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RAILWAY_STATIC_URL", "")
+    if base_url and not base_url.startswith("http"):
+        base_url = f"https://{base_url}"
+    redirect_uri = f"{base_url}/auth/lark/callback"
+
+    oauth_url = lark_client.get_oauth_url(redirect_uri=redirect_uri)
+    logger.info(f"🔑 OAuth redirect_uri: {redirect_uri}")
+
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=oauth_url)
+
+
+@app.get("/auth/lark/callback")
+async def lark_oauth_callback(code: str = None, error: str = None, state: str = None):
+    """
+    Step 2 — Lark redirects here after the user approves.
+    The page shows the refresh_token you need to save in Railway env vars.
+    """
+    if error:
+        return {"success": False, "error": error}
+    if not code:
+        return {"success": False, "error": "No auth code received"}
+    if not lark_client:
+        return {"success": False, "error": "Lark client not initialized"}
+
+    result = lark_client.exchange_code_for_tokens(code)
+    if not result.get("success"):
+        return {"success": False, "error": result.get("error")}
+
+    d = result["data"]
+    refresh_token = d.get("refresh_token", "")
+    access_token  = d.get("access_token", "")
+
+    logger.info("✅ OAuth success — user token obtained")
+    return {
+        "success": True,
+        "message": "✅ OAuth thành công! Lưu LARK_USER_REFRESH_TOKEN vào Railway env vars.",
+        "action_required": {
+            "1_go_to": "Railway → project → Variables",
+            "2_add_var": "LARK_USER_REFRESH_TOKEN",
+            "3_value": refresh_token,
+            "4_redeploy": "Railway sẽ tự redeploy sau khi save var",
+        },
+        "access_token_preview": access_token[:20] + "..." if access_token else "",
+        "refresh_token": refresh_token,
+    }
+
+
+@app.get("/auth/lark/status")
+async def lark_auth_status():
+    """Check whether user token is active."""
+    if not lark_client:
+        return {"success": False, "error": "Lark client not initialized"}
+    has_refresh = bool(lark_client.user_refresh_token)
+    has_access  = bool(lark_client.user_access_token)
+    return {
+        "user_token_mode": has_refresh or has_access,
+        "user_refresh_token_set": has_refresh,
+        "user_access_token_active": has_access,
+        "write_mode": "user_token" if (has_refresh or has_access) else "tenant_token (may be read-only)",
+        "env_var_needed": "LARK_USER_REFRESH_TOKEN" if not has_refresh else None,
+    }
+
 
 # ✅ OPTIONAL: Support for direct run (useful for local testing)
 # This is NOT used in Railway (Railway uses Dockerfile CMD instead)
