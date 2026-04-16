@@ -171,7 +171,8 @@ class LarkClient:
                     
                     if not link_value:
                         skipped_count += 1
-                        logger.debug(f"⏭️  Skipping record {item.get('id')} - empty 'Link air bài'")
+                        rid = item.get('record_id') or item.get('id', '?')
+                        logger.debug(f"⏭️  Skipping record {rid} - empty 'Link air bài'")
                         continue
                     
                     all_records.append(item)
@@ -265,6 +266,13 @@ class LarkClient:
             if not update_records:
                 continue
 
+            # Debug: log a sample record_id so we can confirm IDs are non-empty
+            sample_id = update_records[0].get('record_id', '')
+            if not sample_id:
+                logger.warning("⚠️ First record has empty record_id — writes will be skipped by Lark!")
+            else:
+                logger.debug(f"🔑 Sample record_id for this batch: {sample_id}")
+
             try:
                 response = self._make_request(
                     'POST', url,
@@ -343,21 +351,76 @@ class LarkClient:
     def get_record(self, record_id):
         """Get single record by ID"""
         url = f"https://open.larksuite.com/open-apis/bitable/v1/apps/{self.bitable_app_token}/tables/{self.table_id}/records/{record_id}"
-        
+
         try:
             response = self._make_request('GET', url, timeout=10)
-            
+
             if not response:
                 return {}
-            
+
             data = response.json()
-            
+
             if data.get('code') == 0:
                 return data.get('data', {}).get('record', {})
             else:
                 logger.error(f"❌ Error getting record {record_id}: {data}")
                 return {}
-                
+
         except Exception as e:
             logger.error(f"❌ Exception getting record {record_id}: {e}")
             return {}
+
+    def test_write_record(self, record_id: str, fields: dict) -> dict:
+        """
+        Write fields to a single record and read it back immediately.
+        Used by /debug/test-lark-write to verify whether fields are actually writable.
+
+        Returns:
+            dict with keys: success, written_fields, before, after, changed_fields, api_response
+        """
+        # Step 1: Read current values
+        before_record = self.get_record(record_id)
+        before_fields = before_record.get('fields', {}) if before_record else {}
+
+        # Step 2: Write test values
+        url = (
+            f"https://open.larksuite.com/open-apis/bitable/v1/apps/"
+            f"{self.bitable_app_token}/tables/{self.table_id}/records/{record_id}"
+        )
+        write_payload = {'fields': fields}
+        try:
+            response = self._make_request('PUT', url, json=write_payload, timeout=15)
+            if not response:
+                return {'success': False, 'error': 'No response from Lark API'}
+            api_data = response.json()
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+        # Step 3: Read back to verify
+        time.sleep(1)  # Brief wait for Lark to commit
+        after_record = self.get_record(record_id)
+        after_fields = after_record.get('fields', {}) if after_record else {}
+
+        # Step 4: Compare before vs after for each written field
+        changed = {}
+        not_changed = {}
+        for field_name, new_val in fields.items():
+            before_val = before_fields.get(field_name)
+            after_val  = after_fields.get(field_name)
+            if str(after_val) != str(before_val):
+                changed[field_name] = {'before': before_val, 'after': after_val, 'expected': new_val}
+            else:
+                not_changed[field_name] = {'before': before_val, 'after': after_val, 'expected': new_val}
+
+        return {
+            'success': api_data.get('code') == 0,
+            'api_code': api_data.get('code'),
+            'api_msg': api_data.get('msg', ''),
+            'written_fields': fields,
+            'fields_changed_in_bitable': changed,
+            'fields_NOT_changed_in_bitable': not_changed,
+            'verdict': (
+                '✅ Fields ARE writable' if changed and not not_changed
+                else ('⚠️ SOME fields writable' if changed else '❌ Fields are READ-ONLY (type 19 / formula?)')
+            ),
+        }

@@ -217,7 +217,8 @@ class TikTokCrawler:
         """
         try:
             fields = lark_record.get('fields', {})
-            record_id = lark_record.get('id', '')
+            # Lark list API may return either 'record_id' or 'id' depending on version
+            record_id = lark_record.get('record_id') or lark_record.get('id', '')
             
             # Extract Link
             link_field = fields.get('Link air bài', {})
@@ -349,8 +350,9 @@ class TikTokCrawler:
             
             for record in lark_records:
                 fields = record.get('fields', {})
-                record_id = record.get('id', '')
-                
+                # Lark list API may return 'record_id' or 'id' depending on version
+                record_id = record.get('record_id') or record.get('id', '')
+
                 # Extract link
                 link_field = fields.get('Link air bài', {})
                 link_value = self.extract_lark_field_value(link_field, 'link')
@@ -502,7 +504,7 @@ class TikTokCrawler:
                             if record:
                                 pending_records.append({
                                     'url': url,
-                                    'record_id': record.get('id', ''),
+                                    'record_id': record.get('record_id') or record.get('id', ''),
                                 })
                         self.sheets_client.save_pending_retry(pending_records)
                         logger.info(f"⏳ Queued {len(batch_pending_urls)} pending URLs for retry")

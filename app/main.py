@@ -460,6 +460,66 @@ async def debug_lark_fields():
         return {"success": False, "error": str(e)}
 
 
+@app.get("/debug/test-lark-write")
+async def debug_test_lark_write():
+    """
+    Diagnostic: pick the first Lark record and attempt a real write, then read back
+    to verify whether the target fields (type 19?) actually accept writes.
+
+    Fields tested:
+        Status            - written as 'test_write_check'
+        Lần kiểm tra cuối - written as current timestamp (ms)
+
+    The response shows 'fields_changed_in_bitable' vs 'fields_NOT_changed_in_bitable'.
+    If all fields are in NOT_changed → they are read-only (formula / auto-number fields).
+    The user must change those fields in Lark Bitable settings to a writable type
+    (Number / Text / DateTime).
+    """
+    if not lark_client:
+        return {"success": False, "error": "Lark client not initialized"}
+
+    try:
+        # Get first available record
+        records = lark_client.get_all_active_records()
+        if not records:
+            return {"success": False, "error": "No records found in Lark table"}
+
+        first = records[0]
+        # Support both 'record_id' and 'id' keys
+        record_id = first.get('record_id') or first.get('id', '')
+        if not record_id:
+            return {
+                "success": False,
+                "error": "Could not extract record_id from first record",
+                "raw_keys": list(first.keys()),
+            }
+
+        now_ms = int(datetime.now().timestamp() * 1000)
+        test_fields = {
+            'Status': 'test_write_check',
+            'Lần kiểm tra cuối': now_ms,
+        }
+
+        logger.info(f"🧪 Testing write on record {record_id} with fields: {list(test_fields.keys())}")
+        result = lark_client.test_write_record(record_id, test_fields)
+
+        return {
+            "success": True,
+            "record_id_used": record_id,
+            "record_id_source": "record_id key" if first.get('record_id') else "id key",
+            **result,
+            "explanation": (
+                "If 'fields_NOT_changed_in_bitable' contains your write fields, "
+                "those fields are READ-ONLY in Lark (likely type 19 = Formula/AutoNumber). "
+                "Go to Lark Bitable → field settings → change field type to Number / Text / DateTime."
+            ),
+        }
+
+    except Exception as e:
+        logger.error(f"❌ test-lark-write failed: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
 @app.get("/debug/info")
 async def debug_info():
     """
