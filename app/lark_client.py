@@ -232,34 +232,52 @@ class LarkClient:
     
     def _extract_link_value(self, link_field):
         """
-        Extract link value from Lark field
-        Handles both string and dict formats
+        Extract link value from Lark field.
+        Handles all formats the Lark API returns for URL/text fields:
+          - dict with 'text' key  (rich text)
+          - dict with 'link' key  (Lark URL field type 15 — most common)
+          - dict with 'href' key  (legacy / some SDK versions)
+          - list of dicts          (multi-segment rich text)
+          - plain string
         """
         if not link_field:
             return ""
-        
-        # If it's a dictionary (Lark link field format)
+
+        # ── dict (Lark URL field returns {"text": "...", "link": "..."}) ─────
         if isinstance(link_field, dict):
-            # Try 'text' first, then 'href'
-            link_value = link_field.get("text", "") or link_field.get("href", "")
+            # Prioritise 'link' (URL field type 15), then 'text', then 'href'
+            link_value = (
+                link_field.get("link", "")
+                or link_field.get("text", "")
+                or link_field.get("href", "")
+            )
             return str(link_value).strip()
-        
-        # If it's a list (multiple values)
+
+        # ── list (rich-text array or multiple URL segments) ────────────────
         if isinstance(link_field, list):
-            if len(link_field) > 0:
-                first_item = link_field[0]
-                if isinstance(first_item, dict):
-                    link_value = first_item.get("text", "") or first_item.get("href", "")
+            if not link_field:
+                return ""
+            # Walk all segments and return the first non-empty URL/text found
+            for item in link_field:
+                if isinstance(item, dict):
+                    val = (
+                        item.get("link", "")
+                        or item.get("text", "")
+                        or item.get("href", "")
+                    )
+                    val = str(val).strip()
+                    if val:
+                        return val
                 else:
-                    link_value = str(first_item)
-                return link_value.strip()
+                    val = str(item).strip()
+                    if val:
+                        return val
             return ""
-        
-        # If it's a string
+
+        # ── plain string ───────────────────────────────────────────────────
         if isinstance(link_field, str):
             return link_field.strip()
-        
-        # Default
+
         return ""
     
     def get_target_records_by_url(self) -> dict:
@@ -336,33 +354,46 @@ class LarkClient:
                     break
                 
                 items = data.get('data', {}).get('items', [])
-                
+
                 # Filter: Only keep records with non-empty "Link air bài"
                 for item in items:
                     total_processed += 1
                     fields = item.get('fields', {})
-                    
+
                     # 🔑 FILTER: Check "Link air bài" field and extract value properly
                     link_field = fields.get("Link air bài", "")
                     link_value = self._extract_link_value(link_field)
-                    
+
                     if not link_value:
                         skipped_count += 1
                         rid = item.get('record_id') or item.get('id', '?')
-                        logger.debug(f"⏭️  Skipping record {rid} - empty 'Link air bài'")
+                        # Log raw field value at WARNING so it appears in Railway logs
+                        # (helps diagnose format issues — expected to be empty for truly blank rows)
+                        if link_field:
+                            logger.warning(
+                                f"⚠️ Record {rid}: 'Link air bài' field non-empty but unextractable "
+                                f"(type={type(link_field).__name__}, raw={str(link_field)[:120]})"
+                            )
+                        else:
+                            logger.debug(f"⏭️  Skipping record {rid} - 'Link air bài' is blank")
                         continue
-                    
+
                     all_records.append(item)
-                
+
                 # Check for next page
                 page_token = data.get('data', {}).get('page_token')
                 if not page_token:
                     break
-            
-            logger.info(f"✅ Lark Bitable Scan Complete:")
-            logger.info(f"   • Total records processed: {total_processed}")
-            logger.info(f"   • Records with link: {len(all_records)}")
-            logger.info(f"   • Skipped (empty link): {skipped_count}")
+
+            logger.info(
+                f"✅ Lark Bitable Scan: total={total_processed} "
+                f"with_link={len(all_records)} skipped_empty={skipped_count}"
+            )
+            if skipped_count > 0:
+                logger.warning(
+                    f"⚠️ {skipped_count} records skipped — 'Link air bài' blank or unextractable. "
+                    f"Check WARNING lines above for non-empty-but-unextractable cases."
+                )
             
             return all_records
             
