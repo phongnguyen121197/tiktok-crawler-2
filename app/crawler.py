@@ -46,13 +46,32 @@ class TikTokCrawler:
                 if '?' in video_id:
                     video_id = video_id.split('?')[0]
                 return video_id.strip()
-            
+
             logger.warning(f"⚠️ Could not extract video ID from: {url}")
             return None
-            
+
         except Exception as e:
             logger.error(f"❌ Error extracting video ID: {e}")
             return None
+
+    def _normalize_url(self, url: str) -> str:
+        """
+        Strip query params and fragment from a TikTok URL so source-table URLs
+        (which may have tracking params like ?is_from_webapp=1&sender_device=pc)
+        can be matched against clean target-table URLs.
+
+        Example:
+            https://www.tiktok.com/@user/video/123?is_from_webapp=1
+            → https://www.tiktok.com/@user/video/123
+        """
+        if not url:
+            return ""
+        try:
+            from urllib.parse import urlparse, urlunparse
+            p = urlparse(url.strip())
+            return urlunparse((p.scheme, p.netloc, p.path.rstrip('/'), '', '', ''))
+        except Exception:
+            return url.strip()
     
     def extract_lark_field_value(self, field_data, field_type: str = 'text'):
         """
@@ -378,7 +397,11 @@ class TikTokCrawler:
             try:
                 target_record_by_url = self.lark_client.get_target_records_by_url()
                 logger.info(f"✅ Target table loaded: {len(target_record_by_url)} URL→record_id mappings")
-                no_target = [u for u in urls if u not in target_record_by_url]
+                no_target = [
+                    u for u in urls
+                    if u not in target_record_by_url
+                    and self._normalize_url(u) not in target_record_by_url
+                ]
                 if no_target:
                     logger.warning(
                         f"⚠️ {len(no_target)} source URLs have NO matching record in write table "
@@ -488,8 +511,12 @@ class TikTokCrawler:
                         processed = self.process_lark_record(record, tiktok_result)
 
                         if processed:
-                            # Replace source record_id with target table's record_id
-                            target_rid = target_record_by_url.get(url)
+                            # Replace source record_id with target table's record_id.
+                            # Try exact URL first, then normalized (strips query params).
+                            target_rid = (
+                                target_record_by_url.get(url)
+                                or target_record_by_url.get(self._normalize_url(url))
+                            )
                             if not target_rid:
                                 logger.debug(f"⏭️ No target record for URL, skipping write: {url[:60]}")
                                 # Don't count as failure — it's a configuration gap
@@ -759,9 +786,14 @@ class TikTokCrawler:
                     continue
 
                 if result.get('success') and result.get('views', 0) > 0:
-                    # Got data! Use target table record_id for writing
+                    # Got data! Use target table record_id for writing.
+                    # Normalize URL before lookup to handle query-param differences.
                     publish_date = result.get('publish_date') or existing_dates.get(url)
-                    target_rid = target_record_by_url.get(url) or record_id
+                    target_rid = (
+                        target_record_by_url.get(url)
+                        or target_record_by_url.get(self._normalize_url(url))
+                        or record_id
+                    )
                     to_write.append({
                         'record_id': target_rid,
                         'link': url,

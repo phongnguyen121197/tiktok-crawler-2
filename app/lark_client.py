@@ -279,7 +279,31 @@ class LarkClient:
             return link_field.strip()
 
         return ""
-    
+
+    @staticmethod
+    def _normalize_tiktok_url(url: str) -> str:
+        """
+        Strip query string and fragment from a TikTok URL to get the canonical
+        base URL, so source-table URLs (with tracking params) match target-table
+        URLs (usually clean).
+
+        Examples:
+            https://www.tiktok.com/@user/video/123?is_from_webapp=1&sender_device=pc
+            → https://www.tiktok.com/@user/video/123
+
+            https://www.tiktok.com/@user/video/123   (already clean)
+            → https://www.tiktok.com/@user/video/123
+        """
+        if not url:
+            return ""
+        try:
+            from urllib.parse import urlparse, urlunparse
+            p = urlparse(url.strip())
+            # Keep scheme + netloc + path; drop query (?...) and fragment (#...)
+            return urlunparse((p.scheme, p.netloc, p.path.rstrip('/'), '', '', ''))
+        except Exception:
+            return url.strip()
+
     def get_target_records_by_url(self) -> dict:
         """
         Read all records from write_table_id (target table) and return
@@ -311,7 +335,13 @@ class LarkClient:
                     link_field = fields.get('Link TikTok', '')
                     link_value = self._extract_link_value(link_field)
                     if link_value and record_id:
-                        result[link_value] = record_id
+                        # Store normalized URL as key so source URLs with query
+                        # params (?is_from_webapp=1&...) can still match.
+                        normalized = self._normalize_tiktok_url(link_value)
+                        result[normalized] = record_id
+                        # Also keep original in case target table has query params
+                        if normalized != link_value:
+                            result[link_value] = record_id
                 page_token = data.get('data', {}).get('page_token')
                 if not page_token:
                     break
