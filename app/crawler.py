@@ -54,6 +54,29 @@ class TikTokCrawler:
             logger.error(f"❌ Error extracting video ID: {e}")
             return None
 
+    def extract_channel_from_url(self, url: str) -> str:
+        """
+        Extract TikTok channel username (without @) from a video URL.
+
+        Examples:
+            https://www.tiktok.com/@aetodayyy/video/123  →  aetodayyy
+            https://www.tiktok.com/@vinh.quangg18/video/123?is_from_webapp=1  →  vinh.quangg18
+            https://www.tiktok.com/@n_hchou.209  →  n_hchou.209  (profile URL)
+        Returns empty string if username cannot be extracted.
+        """
+        if not url:
+            return ""
+        try:
+            # Find '@' then take segment up to next '/'
+            if '@' in url:
+                after_at = url.split('@', 1)[1]
+                # Strip query params from username segment
+                username = after_at.split('/')[0].split('?')[0].strip()
+                return username
+        except Exception:
+            pass
+        return ""
+
     def _normalize_url(self, url: str) -> str:
         """
         Strip query params and fragment from a TikTok URL so source-table URLs
@@ -242,10 +265,13 @@ class TikTokCrawler:
             # Extract Link
             link_field = fields.get('Link air bài', {})
             link_value = self.extract_lark_field_value(link_field, 'link')
-            
+
             if not link_value:
                 logger.warning(f"⚠️ Record {record_id} has no link, skipping")
                 return None
+
+            # Extract channel username from URL (e.g. @aetodayyy → aetodayyy)
+            channel_id = self.extract_channel_from_url(link_value)
             
             # Extract Current Views from Lark (fallback data)
             current_views_lark = fields.get('Lượt xem hiện tại', [])
@@ -310,6 +336,7 @@ class TikTokCrawler:
             processed_record = {
                 'record_id': record_id,
                 'link': link_value,
+                'channel_id': channel_id,   # TikTok username for "ID kênh" field
                 'views': current_views,
                 'baseline': baseline,
                 'publish_date': publish_date,
@@ -322,8 +349,11 @@ class TikTokCrawler:
                     'tiktok_stats': tiktok_result
                 }
             }
-            
-            logger.debug(f"✅ Processed record {record_id}: {current_views:,} views, Published: {publish_date or 'N/A'} (status: {status})")
+
+            logger.debug(
+                f"✅ Processed record {record_id}: {current_views:,} views, "
+                f"channel={channel_id or 'N/A'}, Published: {publish_date or 'N/A'} (status: {status})"
+            )
             return processed_record
             
         except Exception as e:
@@ -797,6 +827,7 @@ class TikTokCrawler:
                     to_write.append({
                         'record_id': target_rid,
                         'link': url,
+                        'channel_id': self.extract_channel_from_url(url),
                         'views': result['views'],
                         'baseline': result.get('views', 0),  # first-time write, use as baseline
                         'publish_date': publish_date,

@@ -504,6 +504,7 @@ class LarkClient:
             Published Date     - video publish date (only when newly discovered)
             Lần kiểm tra cuối  - timestamp of this crawl run
             Status             - success / partial / broken
+            ID kênh            - TikTok channel username extracted from URL (Text field)
 
         Args:
             records: list of processed record dicts (from process_lark_record)
@@ -546,12 +547,19 @@ class LarkClient:
                         fields['Lượt xem hiện tại'] = int(views)
                     if baseline is not None:
                         fields['Số view 24h trước'] = int(baseline)
-                    # Write publish date to target table (fldWRnSR35, DateTime type 5)
+                    # Write publish date to target table (DateTime type 5)
                     pub_date = record.get('publish_date')
                     if pub_date:
                         pub_ms = self._date_str_to_ms(pub_date)
                         if pub_ms:
                             fields['Published Date'] = pub_ms
+
+                # Write channel username to "ID kênh" (Text field).
+                # Extracted directly from the TikTok URL — always idempotent to overwrite.
+                # Written for both broken and non-broken records (URL is always known).
+                channel_id = record.get('channel_id', '')
+                if channel_id:
+                    fields['ID kênh'] = channel_id
 
                 update_records.append({'record_id': record_id, 'fields': fields})
 
