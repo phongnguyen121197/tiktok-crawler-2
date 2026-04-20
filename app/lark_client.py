@@ -353,80 +353,130 @@ class LarkClient:
 
     def get_all_active_records(self):
         """
-        Get all records with non-empty "Link air bài" field from Lark Bitable
-        Filters out records where link is empty
+        Get all records with non-empty "Link air bài" field from Lark Bitable.
+        Paginates with page_size=500 until has_more=False or page_token is absent.
+        Logs per-page progress at INFO level so Railway log truncation doesn't hide it.
         """
-        url = f"https://open.larksuite.com/open-apis/bitable/v1/apps/{self.bitable_app_token}/tables/{self.table_id}/records"
-        
+        url = (
+            f"https://open.larksuite.com/open-apis/bitable/v1/apps/"
+            f"{self.bitable_app_token}/tables/{self.table_id}/records"
+        )
+
         all_records = []
         page_token = None
         total_processed = 0
         skipped_count = 0
-        
+        page_num = 0
+        api_reported_total = None   # total records Lark says exist in table
+
         try:
             while True:
-                params = {
-                    'page_size': 500
-                }
-                
+                page_num += 1
+                params = {'page_size': 500}
                 if page_token:
                     params['page_token'] = page_token
-                
-                response = self._make_request('GET', url, params=params, timeout=30)
-                
-                if not response:
-                    break
-                
-                data = response.json()
-                
-                if data.get('code') != 0:
-                    logger.error(f"❌ Lark API error: {data}")
-                    break
-                
-                items = data.get('data', {}).get('items', [])
 
-                # Filter: Only keep records with non-empty "Link air bài"
+                response = self._make_request('GET', url, params=params, timeout=30)
+                if not response:
+                    logger.error(
+                        f"❌ Page {page_num}: No response from Lark API — "
+                        f"pagination aborted early! Only {total_processed} records fetched so far."
+                    )
+                    break
+
+                data = response.json()
+                if data.get('code') != 0:
+                    logger.error(f"❌ Lark API error on page {page_num}: {data}")
+                    break
+
+                data_obj = data.get('data', {})
+                items = data_obj.get('items', [])
+
+                # ── First page: log Lark's own total count ───────────────────
+                if page_num == 1:
+                    api_reported_total = data_obj.get('total')
+                    if api_reported_total is not None:
+                        logger.info(
+                            f"📊 Lark source table reports {api_reported_total} total records "
+                            f"(we expect to read all of them across {((api_reported_total - 1) // 500) + 1} pages)"
+                        )
+                    else:
+                        logger.info("📊 Lark API did not return a 'total' field on page 1")
+
+                # ── Filter: keep only records with non-empty "Link air bài" ──
+                page_with_link = 0
                 for item in items:
                     total_processed += 1
                     fields = item.get('fields', {})
-
-                    # 🔑 FILTER: Check "Link air bài" field and extract value properly
                     link_field = fields.get("Link air bài", "")
                     link_value = self._extract_link_value(link_field)
 
                     if not link_value:
                         skipped_count += 1
                         rid = item.get('record_id') or item.get('id', '?')
-                        # Log raw field value at WARNING so it appears in Railway logs
-                        # (helps diagnose format issues — expected to be empty for truly blank rows)
                         if link_field:
                             logger.warning(
-                                f"⚠️ Record {rid}: 'Link air bài' field non-empty but unextractable "
+                                f"⚠️ Record {rid}: 'Link air bài' non-empty but unextractable "
                                 f"(type={type(link_field).__name__}, raw={str(link_field)[:120]})"
                             )
                         else:
-                            logger.debug(f"⏭️  Skipping record {rid} - 'Link air bài' is blank")
+                            logger.debug(f"⏭️  Record {rid}: 'Link air bài' blank, skipping")
                         continue
 
                     all_records.append(item)
+                    page_with_link += 1
 
-                # Check for next page
-                page_token = data.get('data', {}).get('page_token')
+                # ── Per-page progress log at INFO ─────────────────────────────
+                has_more = data_obj.get('has_more', None)
+                page_token = data_obj.get('page_token', '')
+                logger.info(
+                    f"📄 Page {page_num}: {len(items)} fetched | "
+                    f"{page_with_link} with_link | "
+                    f"running total_processed={total_processed} with_link={len(all_records)} | "
+                    f"has_more={has_more} next_page={'yes' if page_token else 'NO'}"
+                )
+
+                # ── Pagination termination logic ──────────────────────────────
                 if not page_token:
+                    # No next page token — normal end of pagination
+                    if has_more:
+                        logger.warning(
+                            f"⚠️ Lark API: page_token is empty but has_more={has_more}. "
+                            f"Possible API inconsistency — stopped at {total_processed} records. "
+                            f"(API reported total={api_reported_total})"
+                        )
                     break
 
+                if has_more is False:
+                    # has_more explicitly False even though page_token exists — stop safely
+                    logger.warning(
+                        f"⚠️ has_more=False but page_token present on page {page_num}. "
+                        f"Stopping pagination to avoid infinite loop."
+                    )
+                    break
+
+            # ── Final summary ────────────────────────────────────────────────
             logger.info(
-                f"✅ Lark Bitable Scan: total={total_processed} "
-                f"with_link={len(all_records)} skipped_empty={skipped_count}"
+                f"✅ Lark Bitable Scan complete: "
+                f"pages={page_num} | total_processed={total_processed} | "
+                f"with_link={len(all_records)} | skipped_empty={skipped_count} | "
+                f"api_reported_total={api_reported_total}"
             )
+            if api_reported_total and total_processed < api_reported_total:
+                logger.warning(
+                    f"⚠️ RECORD COUNT MISMATCH: fetched {total_processed} but Lark reports "
+                    f"{api_reported_total} total records. "
+                    f"Possible causes: pagination stopped early, API error mid-run, "
+                    f"or records added/deleted during scan."
+                )
             if skipped_count > 0:
                 logger.warning(
                     f"⚠️ {skipped_count} records skipped — 'Link air bài' blank or unextractable. "
                     f"Check WARNING lines above for non-empty-but-unextractable cases."
                 )
-            
+
             return all_records
-            
+
         except Exception as e:
             logger.error(f"❌ Error getting records: {e}")
             return []
