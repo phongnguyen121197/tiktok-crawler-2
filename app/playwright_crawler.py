@@ -338,12 +338,14 @@ async def extract_video_data(page: Page, url: str) -> Optional[Dict]:
                     stats = item.get('stats', {})
                     views = stats.get('playCount', 0)
                     if views and views > 0:
+                        author = item.get('author', {})
                         data = {
                             'views': views,
                             'likes': stats.get('diggCount', 0),
                             'comments': stats.get('commentCount', 0),
                             'shares': stats.get('shareCount', 0),
                             'publish_date': convert_timestamp_to_date(item.get('createTime')),
+                            'channel_id': author.get('uniqueId', '') if isinstance(author, dict) else str(author),
                         }
                         extraction_method = 'UNIVERSAL_DATA'
         except Exception as e:
@@ -365,12 +367,16 @@ async def extract_video_data(page: Page, url: str) -> Optional[Dict]:
                         stats = video_data.get('stats', {})
                         views = stats.get('playCount', 0)
                         if views and views > 0:
+                            # In SIGI_STATE, 'author' is usually the uniqueId string directly
+                            raw_author = video_data.get('author', '')
+                            channel_id = raw_author if isinstance(raw_author, str) else raw_author.get('uniqueId', '')
                             data = {
                                 'views': views,
                                 'likes': stats.get('diggCount', 0),
                                 'comments': stats.get('commentCount', 0),
                                 'shares': stats.get('shareCount', 0),
                                 'publish_date': convert_timestamp_to_date(video_data.get('createTime')),
+                                'channel_id': channel_id,
                             }
                             extraction_method = 'SIGI_STATE'
                             break
@@ -394,12 +400,14 @@ async def extract_video_data(page: Page, url: str) -> Optional[Dict]:
                         stats = item_info.get('stats', {})
                         views = stats.get('playCount', 0)
                         if views and views > 0:
+                            author = item_info.get('author', {})
                             data = {
                                 'views': views,
                                 'likes': stats.get('diggCount', 0),
                                 'comments': stats.get('commentCount', 0),
                                 'shares': stats.get('shareCount', 0),
                                 'publish_date': convert_timestamp_to_date(item_info.get('createTime')),
+                                'channel_id': author.get('uniqueId', '') if isinstance(author, dict) else str(author),
                             }
                             extraction_method = 'NEXT_DATA'
             except Exception as e:
@@ -431,18 +439,21 @@ async def extract_video_data(page: Page, url: str) -> Optional[Dict]:
                     # Try to get createTime
                     time_match = re.search(r'"createTime"\s*:\s*"?(\d{10,13})"?', html)
                     publish_date = convert_timestamp_to_date(time_match.group(1)) if time_match else None
-                    
+
                     # Try to get other stats
                     likes_match = re.search(r'"diggCount"\s*:\s*(\d+)', html)
                     comments_match = re.search(r'"commentCount"\s*:\s*(\d+)', html)
                     shares_match = re.search(r'"shareCount"\s*:\s*(\d+)', html)
-                    
+                    # Try to get channel username
+                    username_match = re.search(r'"uniqueId"\s*:\s*"([^"]+)"', html)
+
                     data = {
                         'views': views,
                         'likes': int(likes_match.group(1)) if likes_match else 0,
                         'comments': int(comments_match.group(1)) if comments_match else 0,
                         'shares': int(shares_match.group(1)) if shares_match else 0,
                         'publish_date': publish_date,
+                        'channel_id': username_match.group(1) if username_match else '',
                     }
                     extraction_method = 'REGEX'
             except Exception as e:
@@ -823,8 +834,13 @@ class SequentialTikTokCrawler:
                     else:
                         final_publish_date = None
                 
-                logger.info(f"✅ [{self.stats['success']}/{self.stats['total']}] Views: {data['views']:,} | Date: {final_publish_date or 'N/A'} | {elapsed:.1f}s")
-                
+                channel_id = data.get('channel_id', '')
+                logger.info(
+                    f"✅ [{self.stats['success']}/{self.stats['total']}] "
+                    f"Views: {data['views']:,} | Date: {final_publish_date or 'N/A'} | "
+                    f"Channel: @{channel_id or '?'} | {elapsed:.1f}s"
+                )
+
                 return {
                     'url': url,
                     'success': True,
@@ -833,6 +849,7 @@ class SequentialTikTokCrawler:
                     'comments': data.get('comments', 0),
                     'shares': data.get('shares', 0),
                     'publish_date': final_publish_date,
+                    'channel_id': channel_id,
                     'is_broken': False
                 }
             else:

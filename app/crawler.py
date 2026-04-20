@@ -54,29 +54,6 @@ class TikTokCrawler:
             logger.error(f"❌ Error extracting video ID: {e}")
             return None
 
-    def extract_channel_from_url(self, url: str) -> str:
-        """
-        Extract TikTok channel username (without @) from a video URL.
-
-        Examples:
-            https://www.tiktok.com/@aetodayyy/video/123  →  aetodayyy
-            https://www.tiktok.com/@vinh.quangg18/video/123?is_from_webapp=1  →  vinh.quangg18
-            https://www.tiktok.com/@n_hchou.209  →  n_hchou.209  (profile URL)
-        Returns empty string if username cannot be extracted.
-        """
-        if not url:
-            return ""
-        try:
-            # Find '@' then take segment up to next '/'
-            if '@' in url:
-                after_at = url.split('@', 1)[1]
-                # Strip query params from username segment
-                username = after_at.split('/')[0].split('?')[0].strip()
-                return username
-        except Exception:
-            pass
-        return ""
-
     def _normalize_url(self, url: str) -> str:
         """
         Strip query params and fragment from a TikTok URL so source-table URLs
@@ -270,8 +247,11 @@ class TikTokCrawler:
                 logger.warning(f"⚠️ Record {record_id} has no link, skipping")
                 return None
 
-            # Extract channel username from URL (e.g. @aetodayyy → aetodayyy)
-            channel_id = self.extract_channel_from_url(link_value)
+            # Channel username: prefer page data (handles short URLs like vt.tiktok.com),
+            # fall back to URL parsing only when we have a full non-short URL and no page data.
+            channel_id = ''
+            if tiktok_result:
+                channel_id = tiktok_result.get('channel_id', '')
             
             # Extract Current Views from Lark (fallback data)
             current_views_lark = fields.get('Lượt xem hiện tại', [])
@@ -433,9 +413,9 @@ class TikTokCrawler:
                     and self._normalize_url(u) not in target_record_by_url
                 ]
                 if no_target:
-                    logger.warning(
-                        f"⚠️ {len(no_target)} source URLs have NO matching record in write table "
-                        f"(those won't be updated). Sample: {no_target[:3]}"
+                    logger.info(
+                        f"🆕 {len(no_target)} source URLs not yet in write table — "
+                        f"will be auto-created on first successful crawl. Sample: {no_target[:3]}"
                     )
             except Exception as e:
                 logger.warning(f"⚠️ Could not load target table records: {e}. Writes will be skipped.")
@@ -488,6 +468,7 @@ class TikTokCrawler:
 
             all_processed = []
             total_updated = 0
+            total_created = 0   # NEW: records auto-created in target table
             total_failed = 0
             total_broken = 0
             total_pending = 0
@@ -521,6 +502,7 @@ class TikTokCrawler:
 
                 # ── Process results ────────────────────────────────────────────
                 batch_processed = []
+                batch_to_create = []    # NEW: records missing from target table
                 batch_pending_urls = []
                 batch_failed = 0
                 batch_broken = 0
@@ -548,8 +530,13 @@ class TikTokCrawler:
                                 or target_record_by_url.get(self._normalize_url(url))
                             )
                             if not target_rid:
-                                logger.debug(f"⏭️ No target record for URL, skipping write: {url[:60]}")
-                                # Don't count as failure — it's a configuration gap
+                                # NEW: auto-create instead of skipping. Target table will
+                                # get a fresh record with URL + channel_id + view stats.
+                                batch_to_create.append(processed)
+                                if processed.get('is_broken'):
+                                    batch_broken += 1
+                                elif processed.get('status') != 'success':
+                                    batch_failed += 1
                             else:
                                 processed['record_id'] = target_rid
                                 batch_processed.append(processed)
@@ -574,6 +561,20 @@ class TikTokCrawler:
                     except Exception as e:
                         logger.error(f"❌ Batch {batch_num} Lark write error: {e}")
 
+                # ── Auto-create missing records in target table ──────────────
+                if batch_to_create:
+                    try:
+                        created, create_failed = self.lark_client.batch_create_records(batch_to_create)
+                        total_created += created
+                        # Cache new record_ids so subsequent batches in same run can find them
+                        # (future-proof: currently same URL won't reappear in one run)
+                        logger.info(
+                            f"🆕 Batch {batch_num}/{total_batches} → Lark: "
+                            f"{created} new records created ({create_failed} failed)"
+                        )
+                    except Exception as e:
+                        logger.error(f"❌ Batch {batch_num} Lark create error: {e}")
+
                 # ── Save pending URLs to retry queue ──────────────────────────
                 if batch_pending_urls:
                     try:
@@ -591,6 +592,7 @@ class TikTokCrawler:
                         logger.warning(f"⚠️ Could not save pending queue: {e}")
 
                 all_processed.extend(batch_processed)
+                all_processed.extend(batch_to_create)   # count created records as processed too
                 all_pending_urls.extend(batch_pending_urls)
                 total_failed += batch_failed
                 total_broken += batch_broken
@@ -598,8 +600,8 @@ class TikTokCrawler:
 
                 logger.info(
                     f"📊 Progress: {min(batch_start + len(batch_urls), total_to_crawl)}/{total_to_crawl} "
-                    f"| processed={len(all_processed)} failed={total_failed} "
-                    f"broken={total_broken} pending={total_pending}"
+                    f"| processed={len(all_processed)} updated={total_updated} created={total_created} "
+                    f"failed={total_failed} broken={total_broken} pending={total_pending}"
                 )
             
             # Final summary
@@ -615,6 +617,7 @@ class TikTokCrawler:
                     'processed': len(all_processed),
                     'success': success_count,
                     'lark_updated': total_updated,
+                    'lark_created': total_created,      # NEW: records newly added to target
                     'failed': total_failed,
                     'broken': total_broken,
                     'pending_retry': total_pending,
@@ -827,7 +830,7 @@ class TikTokCrawler:
                     to_write.append({
                         'record_id': target_rid,
                         'link': url,
-                        'channel_id': self.extract_channel_from_url(url),
+                        'channel_id': result.get('channel_id', ''),   # from Playwright result
                         'views': result['views'],
                         'baseline': result.get('views', 0),  # first-time write, use as baseline
                         'publish_date': publish_date,

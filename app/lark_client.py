@@ -616,6 +616,124 @@ class LarkClient:
         logger.info(f"📊 Lark write done: {updated_total} updated, {failed_total} failed")
         return (updated_total, failed_total)
 
+    def batch_create_records(self, records: list) -> tuple:
+        """
+        Batch CREATE new records in the target Bitable table for URLs that
+        exist in the source table but have no matching record in the write
+        table yet. Each created record gets:
+
+            Link TikTok         - the URL itself (URL type, primary match key)
+            ID kênh             - TikTok channel username (Text)
+            Lượt xem hiện tại    - current view count
+            Số view 24h trước    - baseline view count
+            Published Date       - video publish date
+            Lần kiểm tra cuối    - timestamp of this crawl
+            Status               - success / partial / broken
+
+        Args:
+            records: list of processed record dicts (from process_lark_record)
+                     Each must have 'link' (URL) — used as the primary matching
+                     key on subsequent runs.
+        Returns:
+            (created_count, failed_count)
+        """
+        if not records:
+            return (0, 0)
+
+        LARK_BATCH_SIZE = 500
+        created_total = 0
+        failed_total = 0
+        now_ms = int(time.time() * 1000)
+
+        url = (
+            f"https://open.larksuite.com/open-apis/bitable/v1/apps/"
+            f"{self.bitable_app_token}/tables/{self.write_table_id}/records/batch_create"
+        )
+
+        for i in range(0, len(records), LARK_BATCH_SIZE):
+            batch = records[i:i + LARK_BATCH_SIZE]
+            create_records = []
+
+            for record in batch:
+                link = record.get('link', '')
+                if not link:
+                    # Cannot create a target-table record without the URL —
+                    # it's the only way future runs can find and update it.
+                    continue
+
+                is_broken = record.get('is_broken', False)
+                fields = {
+                    # URL field (type 15) accepts dict format {"text": "...", "link": "..."}
+                    'Link TikTok': {'text': link, 'link': link},
+                    'Lần kiểm tra cuối': now_ms,
+                    'Status': 'broken' if is_broken else record.get('status', 'partial'),
+                }
+
+                # ID kênh (channel username) — works for both broken and non-broken
+                # as long as Playwright got it from the page. Short URLs included.
+                channel_id = record.get('channel_id', '')
+                if channel_id:
+                    fields['ID kênh'] = channel_id
+
+                if not is_broken:
+                    views = record.get('views')
+                    baseline = record.get('baseline')
+                    if views is not None:
+                        fields['Lượt xem hiện tại'] = int(views)
+                    if baseline is not None:
+                        fields['Số view 24h trước'] = int(baseline)
+                    pub_date = record.get('publish_date')
+                    if pub_date:
+                        pub_ms = self._date_str_to_ms(pub_date)
+                        if pub_ms:
+                            fields['Published Date'] = pub_ms
+
+                create_records.append({'fields': fields})
+
+            if not create_records:
+                continue
+
+            logger.info(f"🆕 Creating {len(create_records)} new records in target table...")
+
+            try:
+                response = self._make_request(
+                    'POST', url,
+                    json={'records': create_records},
+                    timeout=30,
+                )
+                if not response:
+                    failed_total += len(create_records)
+                    continue
+
+                data = response.json()
+                if data.get('code') == 0:
+                    new_records = data.get('data', {}).get('records', [])
+                    created_total += len(new_records)
+                    logger.info(
+                        f"✅ Lark: created {len(new_records)}/{len(create_records)} new records"
+                    )
+                else:
+                    error_code = data.get('code')
+                    error_msg = data.get('msg', '')
+                    logger.error(
+                        f"❌ Lark batch_create error (code={error_code}): {error_msg}"
+                    )
+                    if error_code == 1254045 and create_records:
+                        sample_fields = list(create_records[0].get('fields', {}).keys())
+                        logger.error(f"   Fields being written: {sample_fields}")
+                        logger.error(f"   Full response: {data}")
+                    failed_total += len(create_records)
+
+            except Exception as e:
+                logger.error(f"❌ Lark batch_create exception: {e}")
+                failed_total += len(create_records)
+
+            if i + LARK_BATCH_SIZE < len(records):
+                time.sleep(0.5)
+
+        logger.info(f"📊 Lark create done: {created_total} created, {failed_total} failed")
+        return (created_total, failed_total)
+
     def get_table_fields(self, table_id: str = None) -> list:
         """
         Get all field definitions from the Lark Bitable table.
