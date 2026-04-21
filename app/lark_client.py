@@ -663,8 +663,9 @@ class LarkClient:
 
                 is_broken = record.get('is_broken', False)
                 fields = {
-                    # URL field (type 15) accepts dict format {"text": "...", "link": "..."}
-                    'Link TikTok': {'text': link, 'link': link},
+                    # "Link TikTok" is a Text field in this workspace (confirmed by
+                    # TextFieldConvFail error when dict format was used). Plain string.
+                    'Link TikTok': link,
                     'Lần kiểm tra cuối': now_ms,
                     'Status': 'broken' if is_broken else record.get('status', 'partial'),
                 }

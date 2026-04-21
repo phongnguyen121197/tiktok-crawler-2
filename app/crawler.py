@@ -247,11 +247,20 @@ class TikTokCrawler:
                 logger.warning(f"⚠️ Record {record_id} has no link, skipping")
                 return None
 
-            # Channel username: prefer page data (handles short URLs like vt.tiktok.com),
-            # fall back to URL parsing only when we have a full non-short URL and no page data.
+            # Channel username: prefer page data from Playwright (handles short URLs
+            # like vt.tiktok.com/...). Fall back to URL parsing ONLY when Playwright
+            # didn't return one — this covers failed/broken crawls where the full URL
+            # is known. Skip the fallback for short URLs since they don't contain @user.
             channel_id = ''
             if tiktok_result:
-                channel_id = tiktok_result.get('channel_id', '')
+                channel_id = tiktok_result.get('channel_id', '') or ''
+            if not channel_id and link_value and '@' in link_value:
+                # Only parse full URLs (contain @user segment)
+                try:
+                    after_at = link_value.split('@', 1)[1]
+                    channel_id = after_at.split('/')[0].split('?')[0].strip()
+                except Exception:
+                    channel_id = ''
             
             # Extract Current Views from Lark (fallback data)
             current_views_lark = fields.get('Lượt xem hiện tại', [])
