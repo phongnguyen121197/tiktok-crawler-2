@@ -70,11 +70,11 @@ HTTP_HEADERS = {
 HTTP_TIMEOUT = 10
 HTTP_SLEEP = 0.3
 
-PW_TIMEOUT_MS = 15000
+PW_TIMEOUT_MS = 15000       # max time for page.goto() to finish
+PW_MAX_WAIT_MS = 5000       # max time to poll page.url for JS redirect (500ms interval)
 PW_BATCH_SIZE = 60          # URLs per Playwright session (browser restart interval)
 PW_CONCURRENCY = 3          # pages running concurrently within a session
 PW_SLEEP = 0.2              # gap between spawning pages
-PW_SETTLE_MS = 1500         # ms to wait after load for JS redirects to finish
 
 LARK_BATCH_SIZE = 500
 
@@ -227,15 +227,29 @@ def resolve_via_http(short_url: str) -> Optional[str]:
 
 
 async def _pw_resolve_one(context, url: str) -> Optional[str]:
-    """Resolve a single short URL inside an existing Playwright context."""
+    """
+    Resolve a single short URL inside an existing Playwright context.
+
+    Adaptive wait: poll page.url every 500ms for up to PW_MAX_WAIT_MS.
+    Returns as soon as the URL redirects to a full or partial video URL,
+    so fast redirects (~500ms) aren't delayed by a blanket sleep.
+    """
     page = None
     try:
         page = await context.new_page()
-        # 'load' fires when the page is ready; most JS redirects run before/at this
         await page.goto(url, wait_until="load", timeout=PW_TIMEOUT_MS)
-        # Short settle for any late JS redirect (TikTok's short_fallback fires fast)
-        await page.wait_for_timeout(PW_SETTLE_MS)
+
+        # Poll for URL change — TikTok's JS redirect may fire any time
+        # between 100ms and several seconds after load.
         final = page.url
+        deadline = PW_MAX_WAIT_MS
+        elapsed = 0
+        while elapsed < deadline:
+            if is_full_url(final) or is_partial_url(final):
+                break
+            await page.wait_for_timeout(500)
+            elapsed += 500
+            final = page.url
 
         # ── URL-based resolution (fastest path) ──────────────────────
         if is_full_url(final):
@@ -266,6 +280,19 @@ async def _pw_resolve_one(context, url: str) -> Optional[str]:
                         return f"https://www.tiktok.com/@{username}/video/{video_id}"
                 except Exception:
                     pass
+
+        # Still stuck on short domain — last resort, scan whatever HTML
+        # happened to load for any full TikTok URL
+        try:
+            html = await page.content()
+            m = re.search(
+                rf'https?://(?:www\.)?tiktok\.com/@{USERNAME_CHARS}/video/\d+',
+                html,
+            )
+            if m:
+                return normalize_full_url(m.group(0))
+        except Exception:
+            pass
 
         return None
     finally:
@@ -377,8 +404,14 @@ def batch_update_source_field(lark: LarkClient, updates: list) -> tuple:
 
     for i in range(0, len(updates), LARK_BATCH_SIZE):
         chunk = updates[i:i + LARK_BATCH_SIZE]
+        # "Link air bài" in this workspace's source table is a URL field
+        # (type 15). Lark rejects plain strings with URLFieldConvFail
+        # (code 1254068); it requires the object form.
         payload = [
-            {"record_id": u["record_id"], "fields": {FIELD_NAME: u["new_url"]}}
+            {
+                "record_id": u["record_id"],
+                "fields": {FIELD_NAME: {"text": u["new_url"], "link": u["new_url"]}},
+            }
             for u in chunk
         ]
         try:
@@ -395,10 +428,10 @@ def batch_update_source_field(lark: LarkClient, updates: list) -> tuple:
                 fail += len(chunk)
                 code = data.get("code")
                 logger.error(f"  ❌ Batch error (code={code}): {data.get('msg')}")
-                if code == 1254060:
+                if code in (1254060, 1254068):
                     logger.error(
-                        f"  → 'Link air bài' rejected plain string. Field may require "
-                        f"URL object format. Sample: {payload[0]}"
+                        f"  → Field type mismatch on '{FIELD_NAME}'. "
+                        f"Sample payload: {payload[0]}"
                     )
         except Exception as e:
             fail += len(chunk)
