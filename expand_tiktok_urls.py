@@ -54,7 +54,10 @@ SHORT_URL_PATTERN = re.compile(
     r'^https?://(vt|vm|m)\.tiktok\.com/[A-Za-z0-9]+/?',
     re.IGNORECASE,
 )
-FULL_URL_PATTERN = re.compile(r'tiktok\.com/@[^/]+/video/\d+', re.IGNORECASE)
+# Accept both `@username/video/ID` and `@/video/ID` (empty username — TikTok's
+# "short_fallback" redirect format). Username is optional for our purposes
+# because the video ID alone is enough for the crawler to identify it.
+FULL_URL_PATTERN = re.compile(r'tiktok\.com/@[^/]*/video/\d+', re.IGNORECASE)
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -127,7 +130,7 @@ def resolve_via_http(short_url: str) -> Optional[str]:
             # returns a page containing a canonical <link> or JSON payload.
             html = resp.text or ''
             m = re.search(
-                r'https?://(?:www\.)?tiktok\.com/@[^/\s"\'<>]+/video/\d+',
+                r'https?://(?:www\.)?tiktok\.com/@[^/\s"\'<>]*/video/\d+',
                 html,
             )
             if m:
@@ -142,75 +145,109 @@ def resolve_via_http(short_url: str) -> Optional[str]:
 async def _pw_resolve_batch(urls: list) -> dict:
     """
     Playwright fallback. Loads each short URL, waits for JS redirects to
-    settle, then reads the final URL. If the URL stays short (redirect
-    happened client-side and we read page.url too early), falls back to
-    the <link rel="canonical"> tag and an HTML regex scan.
+    settle, then reads the final URL. Falls back to <link rel="canonical">
+    and rendered-HTML regex if the final URL stays on a short domain.
+
+    Browser/context is recreated on crash because --single-process was
+    seen to kill the context after a single page in some cases. We start
+    WITHOUT --single-process here; stability > marginal RAM savings for
+    a one-off script.
     """
     from playwright.async_api import async_playwright
 
-    results = {}
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process"],
-        )
+    LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+
+    async def _new_browser(p):
+        browser = await p.chromium.launch(headless=True, args=LAUNCH_ARGS)
         context = await browser.new_context(
             user_agent=HTTP_HEADERS["User-Agent"],
             locale="en-US",
         )
+        return browser, context
+
+    results = {}
+    async with async_playwright() as p:
+        browser, context = await _new_browser(p)
+
         for url in urls:
             resolved = None
-            try:
-                page = await context.new_page()
-                await page.goto(url, wait_until="load", timeout=PW_TIMEOUT_MS)
-                # Let any JS redirect settle
-                await asyncio.sleep(2)
-                final = page.url
+            final = ''
+            page = None
 
-                # If we're still on the short domain, wait a bit more —
-                # sometimes the JS redirect fires after initial load.
-                if any(x in final for x in ("vt.tiktok.com", "vm.tiktok.com")):
-                    await asyncio.sleep(3)
+            # Try up to 2 times: if context is dead, recreate and retry once
+            for attempt in range(2):
+                try:
+                    page = await context.new_page()
+                    await page.goto(url, wait_until="load", timeout=PW_TIMEOUT_MS)
+                    await asyncio.sleep(2)   # let any JS redirect settle
                     final = page.url
 
-                if is_full_url(final):
-                    resolved = normalize_full_url(final)
-                else:
-                    # Canonical link — most reliable alternate source
-                    try:
-                        canonical = await page.evaluate(
-                            """() => {
-                                const el = document.querySelector('link[rel="canonical"]');
-                                return el ? el.href : '';
-                            }"""
-                        )
-                        if is_full_url(canonical):
-                            resolved = normalize_full_url(canonical)
-                    except Exception:
-                        pass
+                    if any(x in final for x in ("vt.tiktok.com", "vm.tiktok.com")):
+                        await asyncio.sleep(3)
+                        final = page.url
 
-                    # Last resort — regex the rendered HTML
-                    if not resolved:
+                    if is_full_url(final):
+                        resolved = normalize_full_url(final)
+                    else:
+                        # Canonical <link> tag — most reliable alternate source
                         try:
-                            html = await page.content()
-                            m = re.search(
-                                r'https?://(?:www\.)?tiktok\.com/@[^/\s"\'<>]+/video/\d+',
-                                html,
+                            canonical = await page.evaluate(
+                                """() => {
+                                    const el = document.querySelector('link[rel="canonical"]');
+                                    return el ? el.href : '';
+                                }"""
                             )
-                            if m:
-                                resolved = normalize_full_url(m.group(0))
+                            if is_full_url(canonical):
+                                resolved = normalize_full_url(canonical)
                         except Exception:
                             pass
 
-                logger.info(f"  pw: {url} → {resolved or f'(failed, final={final})'}")
-                await page.close()
-            except Exception as e:
-                logger.debug(f"pw resolve fail {url}: {e}")
-                logger.info(f"  pw: {url} → (exception: {str(e)[:60]})")
+                        # Last resort — regex the rendered HTML
+                        if not resolved:
+                            try:
+                                html = await page.content()
+                                m = re.search(
+                                    r'https?://(?:www\.)?tiktok\.com/@[^/\s"\'<>]*/video/\d+',
+                                    html,
+                                )
+                                if m:
+                                    resolved = normalize_full_url(m.group(0))
+                            except Exception:
+                                pass
+
+                    await page.close()
+                    break  # success — exit retry loop
+
+                except Exception as e:
+                    msg = str(e)
+                    logger.debug(f"pw attempt {attempt + 1} fail {url}: {msg[:100]}")
+
+                    # If the context/browser died, rebuild and retry once
+                    if any(k in msg for k in ("Target page", "context", "browser has been closed", "crashed")):
+                        if attempt == 0:
+                            logger.warning(f"  pw: context died — restarting browser...")
+                            try:
+                                await browser.close()
+                            except Exception:
+                                pass
+                            browser, context = await _new_browser(p)
+                            continue    # retry with fresh context
+                    # Non-recoverable or already retried
+                    logger.info(f"  pw: {url} → (exception: {msg[:80]})")
+                    break
+
+            if resolved:
+                logger.info(f"  pw ✓ {url} → {resolved}")
+            elif final:
+                logger.info(f"  pw ✗ {url} → (final URL didn't match: {final[:80]})")
+
             results[url] = resolved
             await asyncio.sleep(PW_SLEEP)
-        await context.close()
-        await browser.close()
+
+        try:
+            await browser.close()
+        except Exception:
+            pass
     return results
 
 
