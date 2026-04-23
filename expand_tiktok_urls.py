@@ -54,10 +54,13 @@ SHORT_URL_PATTERN = re.compile(
     r'^https?://(vt|vm|m)\.tiktok\.com/[A-Za-z0-9]+/?',
     re.IGNORECASE,
 )
-# Accept both `@username/video/ID` and `@/video/ID` (empty username — TikTok's
-# "short_fallback" redirect format). Username is optional for our purposes
-# because the video ID alone is enough for the crawler to identify it.
-FULL_URL_PATTERN = re.compile(r'tiktok\.com/@[^/]*/video/\d+', re.IGNORECASE)
+# Intermediate format: may have empty username (@/video/ID) from TikTok's
+# "short_fallback" redirect. We'll enrich these to full form with username.
+PARTIAL_URL_PATTERN = re.compile(r'tiktok\.com/@[^/]*/video/\d+', re.IGNORECASE)
+# Target format — MUST have a real username (≥1 char between @ and /video/)
+FULL_URL_PATTERN = re.compile(r'tiktok\.com/@[a-zA-Z0-9_.\-]+/video/\d+', re.IGNORECASE)
+# TikTok username character class (letters, digits, underscore, period, hyphen)
+USERNAME_CHARS = r'[a-zA-Z0-9_.\-]+'
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -88,12 +91,23 @@ def is_short_url(url: str) -> bool:
     return bool(SHORT_URL_PATTERN.match((url or '').strip()))
 
 
+def is_partial_url(url: str) -> bool:
+    """URL matches @*/video/ID pattern — may or may not have username."""
+    return bool(PARTIAL_URL_PATTERN.search(url or ''))
+
+
 def is_full_url(url: str) -> bool:
+    """URL has a real @username segment."""
     return bool(FULL_URL_PATTERN.search(url or ''))
 
 
+def extract_video_id(url: str) -> Optional[str]:
+    m = re.search(r'/video/(\d+)', url or '')
+    return m.group(1) if m else None
+
+
 def normalize_full_url(url: str) -> str:
-    """Strip query string/fragment from a full TikTok URL."""
+    """Strip query string/fragment from a TikTok URL."""
     try:
         p = urlparse(url)
         return urlunparse((p.scheme, p.netloc, p.path.rstrip('/'), '', '', ''))
@@ -101,42 +115,152 @@ def normalize_full_url(url: str) -> str:
         return url.rstrip('/')
 
 
+def _extract_username_from_html(html: str, video_id: str) -> Optional[str]:
+    """
+    Scan a TikTok video page HTML body for the author's uniqueId.
+    Used to enrich @/video/ID partial URLs with the real username.
+
+    Methods, in order of reliability:
+      1. <link rel="canonical" href="...@user/video/ID">
+      2. <meta property="og:url" content="...@user/video/ID">
+      3. __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON → author.uniqueId
+      4. regex hunt for "uniqueId":"..." in page scripts
+      5. regex hunt for any tiktok.com/@USER/video/VIDEO_ID match
+    """
+    if not html or not video_id:
+        return None
+
+    # 1. canonical link
+    for m in re.finditer(
+        r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)["\']',
+        html, re.IGNORECASE,
+    ):
+        um = re.match(
+            rf'https?://(?:www\.)?tiktok\.com/@({USERNAME_CHARS})/video/{video_id}',
+            m.group(1),
+        )
+        if um:
+            return um.group(1)
+
+    # 2. og:url meta
+    for m in re.finditer(
+        r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\']([^"\']+)["\']',
+        html, re.IGNORECASE,
+    ):
+        um = re.match(
+            rf'https?://(?:www\.)?tiktok\.com/@({USERNAME_CHARS})/video/{video_id}',
+            m.group(1),
+        )
+        if um:
+            return um.group(1)
+
+    # 3. UNIVERSAL_DATA JSON — same data source the Playwright crawler uses
+    m = re.search(
+        r'<script[^>]+id=["\']__UNIVERSAL_DATA_FOR_REHYDRATION__["\'][^>]*>([^<]+)</script>',
+        html,
+    )
+    if m:
+        try:
+            j = json.loads(m.group(1))
+            author = (
+                j.get('__DEFAULT_SCOPE__', {})
+                 .get('webapp.video-detail', {})
+                 .get('itemInfo', {})
+                 .get('itemStruct', {})
+                 .get('author', {})
+            )
+            uid = author.get('uniqueId') if isinstance(author, dict) else None
+            if uid:
+                return uid
+        except Exception:
+            pass
+
+    # 4. direct uniqueId regex
+    m = re.search(rf'"uniqueId"\s*:\s*"({USERNAME_CHARS})"', html)
+    if m:
+        return m.group(1)
+
+    # 5. full @user/video/ID pattern anywhere in HTML for this specific video
+    m = re.search(
+        rf'https?://(?:www\.)?tiktok\.com/@({USERNAME_CHARS})/video/{video_id}',
+        html,
+    )
+    if m:
+        return m.group(1)
+
+    return None
+
+
 def resolve_via_http(short_url: str) -> Optional[str]:
     """
-    Follow HTTP redirects, scan redirect chain + response HTML for full URL.
-    TikTok short URLs sometimes use a JS redirect, meaning the final
-    `resp.url` is still the short form but the HTML body references the
-    full @user/video/ID URL (canonical meta tag or embedded JSON).
+    Two-phase HTTP resolution:
+
+    Phase 1 — follow short URL redirect. TikTok usually lands on either
+      - https://www.tiktok.com/@user/video/ID   (happy path — full URL)
+      - https://www.tiktok.com/@/video/ID       (short_fallback — empty user)
+
+    Phase 2 — if Phase 1 gave partial (empty user), GET that page and
+      extract the real username from the rendered HTML (canonical link,
+      og:url meta, or __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON).
+
+    Returns the full @user/video/ID URL, or None if username can't
+    be determined (caller will try Playwright next).
     """
     try:
         with requests.Session() as s:
             s.headers.update(HTTP_HEADERS)
+
+            # ── Phase 1: follow short URL redirect ───────────────────
             resp = s.get(short_url, allow_redirects=True, timeout=HTTP_TIMEOUT)
             final = resp.url or ''
 
-            # Happy path — redirect chain ended at full URL
-            if is_full_url(final):
-                return normalize_full_url(final)
+            # Find a partial/full URL from: final URL, redirect history, or HTML
+            partial = None
+            if is_partial_url(final):
+                partial = normalize_full_url(final)
+            else:
+                for r in resp.history:
+                    if is_partial_url(r.url):
+                        partial = normalize_full_url(r.url)
+                        break
+                    loc = r.headers.get("Location", "")
+                    if is_partial_url(loc):
+                        partial = normalize_full_url(loc)
+                        break
+                if not partial:
+                    m = re.search(
+                        r'https?://(?:www\.)?tiktok\.com/@[^/\s"\'<>]*/video/\d+',
+                        resp.text or '',
+                    )
+                    if m:
+                        partial = normalize_full_url(m.group(0))
 
-            # Walk the redirect history looking for a full URL
-            for r in resp.history:
-                if is_full_url(r.url):
-                    return normalize_full_url(r.url)
-                loc = r.headers.get("Location", "")
-                if is_full_url(loc):
-                    return normalize_full_url(loc)
+            if not partial:
+                logger.debug(f"  http phase1 fail: {short_url} → final={final}")
+                return None
 
-            # Last resort — scan the HTML body. Works when the short URL
-            # returns a page containing a canonical <link> or JSON payload.
-            html = resp.text or ''
-            m = re.search(
-                r'https?://(?:www\.)?tiktok\.com/@[^/\s"\'<>]*/video/\d+',
-                html,
-            )
-            if m:
-                return normalize_full_url(m.group(0))
+            # If Phase 1 already gave us a full URL with username, done
+            if is_full_url(partial):
+                return partial
 
-            logger.debug(f"  http no-resolve: {short_url} → final={final} (history={len(resp.history)})")
+            # ── Phase 2: enrich partial URL with real username ───────
+            video_id = extract_video_id(partial)
+            if not video_id:
+                return None
+
+            resp2 = s.get(partial, allow_redirects=True, timeout=HTTP_TIMEOUT)
+            final2 = resp2.url or ''
+
+            # Sometimes GET-ing the partial URL itself redirects to full form
+            if is_full_url(final2):
+                return normalize_full_url(final2)
+
+            # Otherwise parse the page HTML for the username
+            username = _extract_username_from_html(resp2.text or '', video_id)
+            if username:
+                return f"https://www.tiktok.com/@{username}/video/{video_id}"
+
+            logger.debug(f"  http phase2 fail: {partial} (video_id={video_id})")
     except Exception as e:
         logger.debug(f"http resolve fail {short_url}: {e}")
     return None
@@ -186,10 +310,18 @@ async def _pw_resolve_batch(urls: list) -> dict:
                         await asyncio.sleep(3)
                         final = page.url
 
+                    # Extract the page HTML once — we may need it for
+                    # username enrichment even if `final` has a username.
+                    html = ''
+                    try:
+                        html = await page.content()
+                    except Exception:
+                        pass
+
                     if is_full_url(final):
                         resolved = normalize_full_url(final)
                     else:
-                        # Canonical <link> tag — most reliable alternate source
+                        # Canonical <link> tag first
                         try:
                             canonical = await page.evaluate(
                                 """() => {
@@ -202,18 +334,23 @@ async def _pw_resolve_batch(urls: list) -> dict:
                         except Exception:
                             pass
 
-                        # Last resort — regex the rendered HTML
-                        if not resolved:
-                            try:
-                                html = await page.content()
-                                m = re.search(
-                                    r'https?://(?:www\.)?tiktok\.com/@[^/\s"\'<>]*/video/\d+',
-                                    html,
-                                )
-                                if m:
-                                    resolved = normalize_full_url(m.group(0))
-                            except Exception:
-                                pass
+                        # Enrichment: if URL is partial (@/video/ID), look
+                        # up the real username from the page HTML.
+                        if not resolved and is_partial_url(final):
+                            video_id = extract_video_id(final)
+                            if video_id and html:
+                                username = _extract_username_from_html(html, video_id)
+                                if username:
+                                    resolved = f"https://www.tiktok.com/@{username}/video/{video_id}"
+
+                        # Last resort — regex scan of rendered HTML
+                        if not resolved and html:
+                            m = re.search(
+                                rf'https?://(?:www\.)?tiktok\.com/@{USERNAME_CHARS}/video/\d+',
+                                html,
+                            )
+                            if m:
+                                resolved = normalize_full_url(m.group(0))
 
                     await page.close()
                     break  # success — exit retry loop
