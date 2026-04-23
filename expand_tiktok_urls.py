@@ -71,8 +71,10 @@ HTTP_TIMEOUT = 10
 HTTP_SLEEP = 0.3
 
 PW_TIMEOUT_MS = 15000
-PW_BATCH_SIZE = 20
-PW_SLEEP = 0.5
+PW_BATCH_SIZE = 60          # URLs per Playwright session (browser restart interval)
+PW_CONCURRENCY = 3          # pages running concurrently within a session
+PW_SLEEP = 0.2              # gap between spawning pages
+PW_SETTLE_MS = 1500         # ms to wait after load for JS redirects to finish
 
 LARK_BATCH_SIZE = 500
 
@@ -191,225 +193,153 @@ def _extract_username_from_html(html: str, video_id: str) -> Optional[str]:
     return None
 
 
-def _get_username_via_oembed(short_or_video_url: str, session: requests.Session) -> Optional[str]:
-    """
-    Query TikTok's public oEmbed endpoint for the video's author username.
-    oEmbed returns JSON with author_url like 'https://www.tiktok.com/@username'.
-    This endpoint is NOT bot-protected like the video page itself.
-    Accepts either the short URL or a partial @/video/ID URL as input.
-    """
-    try:
-        resp = session.get(
-            'https://www.tiktok.com/oembed',
-            params={'url': short_or_video_url},
-            timeout=HTTP_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        author_url = data.get('author_url', '') or ''
-        m = re.match(
-            rf'https?://(?:www\.)?tiktok\.com/@({USERNAME_CHARS})',
-            author_url,
-        )
-        if m:
-            return m.group(1)
-    except Exception as e:
-        logger.debug(f"oembed fail {short_or_video_url}: {e}")
-    return None
-
-
 def resolve_via_http(short_url: str) -> Optional[str]:
     """
-    Two-phase HTTP resolution:
+    Quick HTTP check: follow the short URL and return the final URL ONLY
+    if it lands directly on a full @user/video/ID form. Returns None for
+    anything else (empty-user partial URL, non-video page, blocker, etc.)
+    so the caller falls through to Playwright.
 
-    Phase 1 — follow short URL HTTP redirect.
-      - If we land on https://www.tiktok.com/@user/video/ID → done
-      - If we land on https://www.tiktok.com/@/video/ID    → Phase 2
-      - Any other outcome → return None (Playwright fallback)
-
-    Phase 2 — oEmbed API lookup to get the real username.
-      GET https://www.tiktok.com/oembed?url=<short_url> returns JSON
-      with author_url containing @username. This is a public embed
-      API that's not behind TikTok's bot-detection layer (unlike the
-      full video page, which blocks plain `requests` clients).
-
-    Returns the full @user/video/ID URL, or None (caller tries Playwright).
+    Why so conservative? TikTok's short_fallback redirect returns the
+    partial @/video/ID form without the username, and TikTok's video
+    page blocks plain `requests` clients for HTML scraping, and oEmbed
+    won't accept short URLs as input. Playwright is the only reliable
+    way to recover the username.
     """
     try:
         with requests.Session() as s:
             s.headers.update(HTTP_HEADERS)
-
-            # ── Phase 1: follow redirect ─────────────────────────────
             resp = s.get(short_url, allow_redirects=True, timeout=HTTP_TIMEOUT)
             final = resp.url or ''
-
-            # Already full URL with username — done in one shot
             if is_full_url(final):
                 return normalize_full_url(final)
-
-            # Otherwise, extract video ID from whatever TikTok gave us
-            partial = final if is_partial_url(final) else None
-            if not partial:
-                # Walk redirect history / HTML body
-                for r in resp.history:
-                    if is_partial_url(r.url):
-                        partial = r.url
-                        break
-                    loc = r.headers.get("Location", "")
-                    if is_partial_url(loc):
-                        partial = loc
-                        break
-                if not partial:
-                    m = re.search(
-                        r'https?://(?:www\.)?tiktok\.com/@[^/\s"\'<>]*/video/\d+',
-                        resp.text or '',
-                    )
-                    if m:
-                        partial = m.group(0)
-
-            if not partial:
-                logger.debug(f"  http phase1 no video URL: {short_url} → {final}")
-                return None
-
-            video_id = extract_video_id(partial)
-            if not video_id:
-                return None
-
-            # If already full, done
-            if is_full_url(partial):
-                return normalize_full_url(partial)
-
-            # ── Phase 2: oEmbed lookup for username ──────────────────
-            username = _get_username_via_oembed(short_url, s)
-            if username:
-                return f"https://www.tiktok.com/@{username}/video/{video_id}"
-
-            logger.debug(f"  http phase2 (oembed) fail: {short_url} video_id={video_id}")
+            # Walk redirect history — sometimes the intermediate URL is full
+            # even if the final one got rewritten
+            for r in resp.history:
+                if is_full_url(r.url):
+                    return normalize_full_url(r.url)
+                loc = r.headers.get("Location", "")
+                if is_full_url(loc):
+                    return normalize_full_url(loc)
     except Exception as e:
         logger.debug(f"http resolve fail {short_url}: {e}")
     return None
 
 
+async def _pw_resolve_one(context, url: str) -> Optional[str]:
+    """Resolve a single short URL inside an existing Playwright context."""
+    page = None
+    try:
+        page = await context.new_page()
+        # 'load' fires when the page is ready; most JS redirects run before/at this
+        await page.goto(url, wait_until="load", timeout=PW_TIMEOUT_MS)
+        # Short settle for any late JS redirect (TikTok's short_fallback fires fast)
+        await page.wait_for_timeout(PW_SETTLE_MS)
+        final = page.url
+
+        # ── URL-based resolution (fastest path) ──────────────────────
+        if is_full_url(final):
+            return normalize_full_url(final)
+
+        # ── Partial URL (@/video/ID) — extract username from page ────
+        if is_partial_url(final):
+            video_id = extract_video_id(final)
+            if video_id:
+                # Try canonical <link> tag first
+                try:
+                    canonical = await page.evaluate(
+                        """() => {
+                            const el = document.querySelector('link[rel="canonical"]');
+                            return el ? el.href : '';
+                        }"""
+                    )
+                    if is_full_url(canonical):
+                        return normalize_full_url(canonical)
+                except Exception:
+                    pass
+
+                # Scan HTML for uniqueId or full URL pattern
+                try:
+                    html = await page.content()
+                    username = _extract_username_from_html(html, video_id)
+                    if username:
+                        return f"https://www.tiktok.com/@{username}/video/{video_id}"
+                except Exception:
+                    pass
+
+        return None
+    finally:
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+
 async def _pw_resolve_batch(urls: list) -> dict:
     """
-    Playwright fallback. Loads each short URL, waits for JS redirects to
-    settle, then reads the final URL. Falls back to <link rel="canonical">
-    and rendered-HTML regex if the final URL stays on a short domain.
-
-    Browser/context is recreated on crash because --single-process was
-    seen to kill the context after a single page in some cases. We start
-    WITHOUT --single-process here; stability > marginal RAM savings for
-    a one-off script.
+    Concurrent Playwright resolver. Spawns up to PW_CONCURRENCY pages
+    at a time within a single browser context, then restarts the
+    browser every PW_BATCH_SIZE URLs to keep memory bounded.
     """
     from playwright.async_api import async_playwright
 
     LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
 
-    async def _new_browser(p):
-        browser = await p.chromium.launch(headless=True, args=LAUNCH_ARGS)
-        context = await browser.new_context(
-            user_agent=HTTP_HEADERS["User-Agent"],
-            locale="en-US",
-        )
-        return browser, context
-
     results = {}
+
     async with async_playwright() as p:
-        browser, context = await _new_browser(p)
 
-        for url in urls:
-            resolved = None
-            final = ''
-            page = None
+        async def _new_browser():
+            browser = await p.chromium.launch(headless=True, args=LAUNCH_ARGS)
+            context = await browser.new_context(
+                user_agent=HTTP_HEADERS["User-Agent"],
+                locale="en-US",
+            )
+            return browser, context
 
-            # Try up to 2 times: if context is dead, recreate and retry once
-            for attempt in range(2):
-                try:
-                    page = await context.new_page()
-                    await page.goto(url, wait_until="load", timeout=PW_TIMEOUT_MS)
-                    await asyncio.sleep(2)   # let any JS redirect settle
-                    final = page.url
-
-                    if any(x in final for x in ("vt.tiktok.com", "vm.tiktok.com")):
-                        await asyncio.sleep(3)
-                        final = page.url
-
-                    # Extract the page HTML once — we may need it for
-                    # username enrichment even if `final` has a username.
-                    html = ''
-                    try:
-                        html = await page.content()
-                    except Exception:
-                        pass
-
-                    if is_full_url(final):
-                        resolved = normalize_full_url(final)
-                    else:
-                        # Canonical <link> tag first
-                        try:
-                            canonical = await page.evaluate(
-                                """() => {
-                                    const el = document.querySelector('link[rel="canonical"]');
-                                    return el ? el.href : '';
-                                }"""
-                            )
-                            if is_full_url(canonical):
-                                resolved = normalize_full_url(canonical)
-                        except Exception:
-                            pass
-
-                        # Enrichment: if URL is partial (@/video/ID), look
-                        # up the real username from the page HTML.
-                        if not resolved and is_partial_url(final):
-                            video_id = extract_video_id(final)
-                            if video_id and html:
-                                username = _extract_username_from_html(html, video_id)
-                                if username:
-                                    resolved = f"https://www.tiktok.com/@{username}/video/{video_id}"
-
-                        # Last resort — regex scan of rendered HTML
-                        if not resolved and html:
-                            m = re.search(
-                                rf'https?://(?:www\.)?tiktok\.com/@{USERNAME_CHARS}/video/\d+',
-                                html,
-                            )
-                            if m:
-                                resolved = normalize_full_url(m.group(0))
-
-                    await page.close()
-                    break  # success — exit retry loop
-
-                except Exception as e:
-                    msg = str(e)
-                    logger.debug(f"pw attempt {attempt + 1} fail {url}: {msg[:100]}")
-
-                    # If the context/browser died, rebuild and retry once
-                    if any(k in msg for k in ("Target page", "context", "browser has been closed", "crashed")):
-                        if attempt == 0:
-                            logger.warning(f"  pw: context died — restarting browser...")
-                            try:
-                                await browser.close()
-                            except Exception:
-                                pass
-                            browser, context = await _new_browser(p)
-                            continue    # retry with fresh context
-                    # Non-recoverable or already retried
-                    logger.info(f"  pw: {url} → (exception: {msg[:80]})")
-                    break
-
-            if resolved:
-                logger.info(f"  pw ✓ {url} → {resolved}")
-            elif final:
-                logger.info(f"  pw ✗ {url} → (final URL didn't match: {final[:80]})")
-
-            results[url] = resolved
-            await asyncio.sleep(PW_SLEEP)
+        browser, context = await _new_browser()
 
         try:
-            await browser.close()
-        except Exception:
-            pass
+            for session_start in range(0, len(urls), PW_BATCH_SIZE):
+                session_urls = urls[session_start:session_start + PW_BATCH_SIZE]
+
+                # Rotate browser at session boundary (except the first)
+                if session_start > 0:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+                    browser, context = await _new_browser()
+
+                # Resolve session_urls with bounded concurrency
+                sem = asyncio.Semaphore(PW_CONCURRENCY)
+
+                async def _with_sem(u):
+                    async with sem:
+                        try:
+                            res = await _pw_resolve_one(context, u)
+                        except Exception as e:
+                            logger.debug(f"pw exception {u}: {str(e)[:100]}")
+                            res = None
+                        if res:
+                            logger.info(f"  pw ✓ {u} → {res}")
+                        else:
+                            logger.info(f"  pw ✗ {u}")
+                        return u, res
+
+                coros = [_with_sem(u) for u in session_urls]
+                pairs = await asyncio.gather(*coros, return_exceptions=True)
+                for item in pairs:
+                    if isinstance(item, Exception):
+                        continue
+                    u, res = item
+                    results[u] = res
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
     return results
 
 
@@ -580,21 +510,17 @@ def main():
 
     logger.info(f"  HTTP: {len(resolved)}/{len(short_records)} resolved")
 
-    # ── Phase 2: Playwright fallback ────────────────────────────────────
+    # ── Phase 2: Playwright fallback (concurrent) ───────────────────────
     if failed and not args.no_playwright:
-        logger.info(f"\n[3/4] Playwright fallback ({len(failed)} URLs)...")
-        for i in range(0, len(failed), PW_BATCH_SIZE):
-            batch = failed[i:i + PW_BATCH_SIZE]
-            bnum = i // PW_BATCH_SIZE + 1
-            total_b = (len(failed) + PW_BATCH_SIZE - 1) // PW_BATCH_SIZE
-            logger.info(f"  batch {bnum}/{total_b} ({len(batch)} URLs)...")
-            try:
-                pw_results = resolve_via_playwright(batch)
-                for su, full in pw_results.items():
-                    if full:
-                        resolved[su] = full
-            except Exception as e:
-                logger.error(f"  Playwright batch {bnum} error: {e}")
+        logger.info(f"\n[3/4] Playwright fallback ({len(failed)} URLs, "
+                    f"{PW_CONCURRENCY} concurrent)...")
+        try:
+            pw_results = resolve_via_playwright(failed)
+            for su, full in pw_results.items():
+                if full:
+                    resolved[su] = full
+        except Exception as e:
+            logger.error(f"  Playwright error: {e}")
     elif failed and args.no_playwright:
         logger.info(f"\n[3/4] Skipping Playwright fallback ({len(failed)} URLs unresolved)")
 
