@@ -230,25 +230,28 @@ async def _pw_resolve_one(context, url: str) -> Optional[str]:
     """
     Resolve a single short URL inside an existing Playwright context.
 
-    Adaptive wait: poll page.url every 500ms for up to PW_MAX_WAIT_MS.
-    Returns as soon as the URL redirects to a full or partial video URL,
-    so fast redirects (~500ms) aren't delayed by a blanket sleep.
+    Uses a simple 2-stage fixed settle (empirically reliable over
+    adaptive polling which had race conditions with JS navigation).
     """
     page = None
+    final = ''
     try:
         page = await context.new_page()
-        await page.goto(url, wait_until="load", timeout=PW_TIMEOUT_MS)
+        try:
+            await page.goto(url, wait_until="load", timeout=PW_TIMEOUT_MS)
+        except Exception as e:
+            # Log so we can see WHY it's failing (previous runs silently
+            # returned None for all URLs when this broke)
+            logger.info(f"  pw goto error for {url}: {str(e)[:100]}")
+            return None
 
-        # Poll for URL change — TikTok's JS redirect may fire any time
-        # between 100ms and several seconds after load.
+        # Fixed settle: 2.5s is enough for most JS redirects
+        await asyncio.sleep(2.5)
         final = page.url
-        deadline = PW_MAX_WAIT_MS
-        elapsed = 0
-        while elapsed < deadline:
-            if is_full_url(final) or is_partial_url(final):
-                break
-            await page.wait_for_timeout(500)
-            elapsed += 500
+
+        # If still on short domain, TikTok redirect hasn't fired — wait more
+        if any(x in final for x in ("vt.tiktok.com", "vm.tiktok.com")):
+            await asyncio.sleep(2.5)
             final = page.url
 
         # ── URL-based resolution (fastest path) ──────────────────────
@@ -281,8 +284,7 @@ async def _pw_resolve_one(context, url: str) -> Optional[str]:
                 except Exception:
                     pass
 
-        # Still stuck on short domain — last resort, scan whatever HTML
-        # happened to load for any full TikTok URL
+        # Last resort — scan whatever HTML loaded for any full TikTok URL
         try:
             html = await page.content()
             m = re.search(
@@ -294,6 +296,11 @@ async def _pw_resolve_one(context, url: str) -> Optional[str]:
         except Exception:
             pass
 
+        logger.debug(f"  pw unresolved: {url} → final={final}")
+        return None
+    except Exception as e:
+        # Log top-level exceptions so we can see them at INFO
+        logger.info(f"  pw error for {url}: {str(e)[:100]} (final={final})")
         return None
     finally:
         if page:
@@ -347,7 +354,7 @@ async def _pw_resolve_batch(urls: list) -> dict:
                         try:
                             res = await _pw_resolve_one(context, u)
                         except Exception as e:
-                            logger.debug(f"pw exception {u}: {str(e)[:100]}")
+                            logger.info(f"  pw wrapper-exc {u}: {str(e)[:100]}")
                             res = None
                         if res:
                             logger.info(f"  pw ✓ {u} → {res}")
