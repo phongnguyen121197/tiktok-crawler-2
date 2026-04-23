@@ -191,41 +191,74 @@ def _extract_username_from_html(html: str, video_id: str) -> Optional[str]:
     return None
 
 
+def _get_username_via_oembed(short_or_video_url: str, session: requests.Session) -> Optional[str]:
+    """
+    Query TikTok's public oEmbed endpoint for the video's author username.
+    oEmbed returns JSON with author_url like 'https://www.tiktok.com/@username'.
+    This endpoint is NOT bot-protected like the video page itself.
+    Accepts either the short URL or a partial @/video/ID URL as input.
+    """
+    try:
+        resp = session.get(
+            'https://www.tiktok.com/oembed',
+            params={'url': short_or_video_url},
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        author_url = data.get('author_url', '') or ''
+        m = re.match(
+            rf'https?://(?:www\.)?tiktok\.com/@({USERNAME_CHARS})',
+            author_url,
+        )
+        if m:
+            return m.group(1)
+    except Exception as e:
+        logger.debug(f"oembed fail {short_or_video_url}: {e}")
+    return None
+
+
 def resolve_via_http(short_url: str) -> Optional[str]:
     """
     Two-phase HTTP resolution:
 
-    Phase 1 — follow short URL redirect. TikTok usually lands on either
-      - https://www.tiktok.com/@user/video/ID   (happy path — full URL)
-      - https://www.tiktok.com/@/video/ID       (short_fallback — empty user)
+    Phase 1 — follow short URL HTTP redirect.
+      - If we land on https://www.tiktok.com/@user/video/ID → done
+      - If we land on https://www.tiktok.com/@/video/ID    → Phase 2
+      - Any other outcome → return None (Playwright fallback)
 
-    Phase 2 — if Phase 1 gave partial (empty user), GET that page and
-      extract the real username from the rendered HTML (canonical link,
-      og:url meta, or __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON).
+    Phase 2 — oEmbed API lookup to get the real username.
+      GET https://www.tiktok.com/oembed?url=<short_url> returns JSON
+      with author_url containing @username. This is a public embed
+      API that's not behind TikTok's bot-detection layer (unlike the
+      full video page, which blocks plain `requests` clients).
 
-    Returns the full @user/video/ID URL, or None if username can't
-    be determined (caller will try Playwright next).
+    Returns the full @user/video/ID URL, or None (caller tries Playwright).
     """
     try:
         with requests.Session() as s:
             s.headers.update(HTTP_HEADERS)
 
-            # ── Phase 1: follow short URL redirect ───────────────────
+            # ── Phase 1: follow redirect ─────────────────────────────
             resp = s.get(short_url, allow_redirects=True, timeout=HTTP_TIMEOUT)
             final = resp.url or ''
 
-            # Find a partial/full URL from: final URL, redirect history, or HTML
-            partial = None
-            if is_partial_url(final):
-                partial = normalize_full_url(final)
-            else:
+            # Already full URL with username — done in one shot
+            if is_full_url(final):
+                return normalize_full_url(final)
+
+            # Otherwise, extract video ID from whatever TikTok gave us
+            partial = final if is_partial_url(final) else None
+            if not partial:
+                # Walk redirect history / HTML body
                 for r in resp.history:
                     if is_partial_url(r.url):
-                        partial = normalize_full_url(r.url)
+                        partial = r.url
                         break
                     loc = r.headers.get("Location", "")
                     if is_partial_url(loc):
-                        partial = normalize_full_url(loc)
+                        partial = loc
                         break
                 if not partial:
                     m = re.search(
@@ -233,34 +266,26 @@ def resolve_via_http(short_url: str) -> Optional[str]:
                         resp.text or '',
                     )
                     if m:
-                        partial = normalize_full_url(m.group(0))
+                        partial = m.group(0)
 
             if not partial:
-                logger.debug(f"  http phase1 fail: {short_url} → final={final}")
+                logger.debug(f"  http phase1 no video URL: {short_url} → {final}")
                 return None
 
-            # If Phase 1 already gave us a full URL with username, done
-            if is_full_url(partial):
-                return partial
-
-            # ── Phase 2: enrich partial URL with real username ───────
             video_id = extract_video_id(partial)
             if not video_id:
                 return None
 
-            resp2 = s.get(partial, allow_redirects=True, timeout=HTTP_TIMEOUT)
-            final2 = resp2.url or ''
+            # If already full, done
+            if is_full_url(partial):
+                return normalize_full_url(partial)
 
-            # Sometimes GET-ing the partial URL itself redirects to full form
-            if is_full_url(final2):
-                return normalize_full_url(final2)
-
-            # Otherwise parse the page HTML for the username
-            username = _extract_username_from_html(resp2.text or '', video_id)
+            # ── Phase 2: oEmbed lookup for username ──────────────────
+            username = _get_username_via_oembed(short_url, s)
             if username:
                 return f"https://www.tiktok.com/@{username}/video/{video_id}"
 
-            logger.debug(f"  http phase2 fail: {partial} (video_id={video_id})")
+            logger.debug(f"  http phase2 (oembed) fail: {short_url} video_id={video_id}")
     except Exception as e:
         logger.debug(f"http resolve fail {short_url}: {e}")
     return None
