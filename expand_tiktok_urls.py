@@ -99,21 +99,53 @@ def normalize_full_url(url: str) -> str:
 
 
 def resolve_via_http(short_url: str) -> Optional[str]:
-    """Follow HTTP redirects. Returns canonical full URL or None."""
+    """
+    Follow HTTP redirects, scan redirect chain + response HTML for full URL.
+    TikTok short URLs sometimes use a JS redirect, meaning the final
+    `resp.url` is still the short form but the HTML body references the
+    full @user/video/ID URL (canonical meta tag or embedded JSON).
+    """
     try:
         with requests.Session() as s:
             s.headers.update(HTTP_HEADERS)
             resp = s.get(short_url, allow_redirects=True, timeout=HTTP_TIMEOUT)
             final = resp.url or ''
+
+            # Happy path — redirect chain ended at full URL
             if is_full_url(final):
                 return normalize_full_url(final)
+
+            # Walk the redirect history looking for a full URL
+            for r in resp.history:
+                if is_full_url(r.url):
+                    return normalize_full_url(r.url)
+                loc = r.headers.get("Location", "")
+                if is_full_url(loc):
+                    return normalize_full_url(loc)
+
+            # Last resort — scan the HTML body. Works when the short URL
+            # returns a page containing a canonical <link> or JSON payload.
+            html = resp.text or ''
+            m = re.search(
+                r'https?://(?:www\.)?tiktok\.com/@[^/\s"\'<>]+/video/\d+',
+                html,
+            )
+            if m:
+                return normalize_full_url(m.group(0))
+
+            logger.debug(f"  http no-resolve: {short_url} → final={final} (history={len(resp.history)})")
     except Exception as e:
         logger.debug(f"http resolve fail {short_url}: {e}")
     return None
 
 
 async def _pw_resolve_batch(urls: list) -> dict:
-    """Playwright fallback: load each URL, read page.url after redirect."""
+    """
+    Playwright fallback. Loads each short URL, waits for JS redirects to
+    settle, then reads the final URL. If the URL stays short (redirect
+    happened client-side and we read page.url too early), falls back to
+    the <link rel="canonical"> tag and an HTML regex scan.
+    """
     from playwright.async_api import async_playwright
 
     results = {}
@@ -127,15 +159,55 @@ async def _pw_resolve_batch(urls: list) -> dict:
             locale="en-US",
         )
         for url in urls:
+            resolved = None
             try:
                 page = await context.new_page()
-                await page.goto(url, wait_until="domcontentloaded", timeout=PW_TIMEOUT_MS)
+                await page.goto(url, wait_until="load", timeout=PW_TIMEOUT_MS)
+                # Let any JS redirect settle
+                await asyncio.sleep(2)
                 final = page.url
+
+                # If we're still on the short domain, wait a bit more —
+                # sometimes the JS redirect fires after initial load.
+                if any(x in final for x in ("vt.tiktok.com", "vm.tiktok.com")):
+                    await asyncio.sleep(3)
+                    final = page.url
+
+                if is_full_url(final):
+                    resolved = normalize_full_url(final)
+                else:
+                    # Canonical link — most reliable alternate source
+                    try:
+                        canonical = await page.evaluate(
+                            """() => {
+                                const el = document.querySelector('link[rel="canonical"]');
+                                return el ? el.href : '';
+                            }"""
+                        )
+                        if is_full_url(canonical):
+                            resolved = normalize_full_url(canonical)
+                    except Exception:
+                        pass
+
+                    # Last resort — regex the rendered HTML
+                    if not resolved:
+                        try:
+                            html = await page.content()
+                            m = re.search(
+                                r'https?://(?:www\.)?tiktok\.com/@[^/\s"\'<>]+/video/\d+',
+                                html,
+                            )
+                            if m:
+                                resolved = normalize_full_url(m.group(0))
+                        except Exception:
+                            pass
+
+                logger.info(f"  pw: {url} → {resolved or f'(failed, final={final})'}")
                 await page.close()
-                results[url] = normalize_full_url(final) if is_full_url(final) else None
             except Exception as e:
                 logger.debug(f"pw resolve fail {url}: {e}")
-                results[url] = None
+                logger.info(f"  pw: {url} → (exception: {str(e)[:60]})")
+            results[url] = resolved
             await asyncio.sleep(PW_SLEEP)
         await context.close()
         await browser.close()
@@ -221,7 +293,13 @@ def main():
                         help="Max short URLs to process (0 = all)")
     parser.add_argument("--no-playwright", action="store_true",
                         help="Skip Playwright fallback (HTTP only)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Verbose debug logs (show each URL resolution attempt)")
     args = parser.parse_args()
+
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+        logging.getLogger().setLevel(logging.DEBUG)
 
     load_dotenv()
     mode = "EXECUTE" if args.execute else "DRY-RUN"
@@ -289,8 +367,14 @@ def main():
         full = resolve_via_http(su)
         if full:
             resolved[su] = full
+            # Show first 3 successes so user can sanity-check format
+            if len([r for r in resolved.values() if r]) <= 3:
+                logger.info(f"  http ✓ {su} → {full}")
         else:
             failed.append(su)
+            # Always show first 3 failures so we can diagnose
+            if len(failed) <= 3:
+                logger.info(f"  http ✗ {su}  (no redirect to full URL)")
         if idx % 25 == 0 or idx == len(short_records):
             logger.info(f"  progress {idx}/{len(short_records)} | ok={len(resolved)} fail={len(failed)}")
         time.sleep(HTTP_SLEEP)
